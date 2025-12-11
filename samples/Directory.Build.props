@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The GC is built for exactly this runtime. -->
+    <RuntimeFrameworkVersion>10.0.14</RuntimeFrameworkVersion>
+    <RollForward>Disable</RollForward>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <UseAppHost>false</UseAppHost>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>
