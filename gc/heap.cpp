@@ -8,6 +8,9 @@ uint8_t* Heap::s_end;
 uint8_t* Heap::s_committed;
 uint8_t* Heap::s_next;
 MethodTable* Heap::s_freeObjectMT;
+uint64_t* Heap::s_startBits;
+uint64_t* Heap::s_markBits;
+uint64_t Heap::s_totalAllocated;
 
 // Threads take this in cooperative mode. Nothing inside the lock waits for the runtime, so a
 // suspension request is delayed by at most one short critical section.
@@ -52,6 +55,11 @@ bool Heap::Initialize(size_t reserveBytes, MethodTable* freeObjectMT)
     uint8_t* cards = Reserve(cardBytes, PROT_READ | PROT_WRITE);
     uint8_t* bundles = Reserve(bundleBytes, PROT_READ | PROT_WRITE);
     if (cards == nullptr || bundles == nullptr)
+        return false;
+
+    s_startBits = (uint64_t*)Reserve(reserveBytes / 64, PROT_READ | PROT_WRITE);
+    s_markBits = (uint64_t*)Reserve(reserveBytes / 64, PROT_READ | PROT_WRITE);
+    if (s_startBits == nullptr || s_markBits == nullptr)
         return false;
 
     WriteBarrierParameters args = {};  // gcinterface.h:59-116
@@ -109,7 +117,7 @@ void Heap::MakeFreeObject(uint8_t* p, size_t size)
     *(uint32_t*)(p + sizeof(void*)) = (uint32_t)(size - min_obj_size);
 }
 
-void Heap::RetireContext(gc_alloc_context* ctx)
+void Heap::RetireContext(gc_alloc_context* ctx, bool discountTail)
 {
     if (ctx->alloc_ptr == nullptr)
         return;
@@ -117,6 +125,8 @@ void Heap::RetireContext(gc_alloc_context* ctx)
     size_t unused = (size_t)(ctx->alloc_limit - ctx->alloc_ptr);
     MakeFreeObject(ctx->alloc_ptr, unused + min_obj_size);
     ctx->alloc_bytes -= (int64_t)unused;
+    if (discountTail)
+        __atomic_sub_fetch(&s_totalAllocated, unused, __ATOMIC_RELAXED);
     ctx->alloc_ptr = nullptr;
     ctx->alloc_limit = nullptr;
 }
@@ -131,7 +141,10 @@ Object* Heap::Alloc(gc_alloc_context* ctx, size_t size, uint32_t flags)
     {
         uint8_t* p = BumpGlobal(size);
         if (p != nullptr)
+        {
             ctx->alloc_bytes_uoh += (int64_t)size;
+            __atomic_add_fetch(&s_totalAllocated, size, __ATOMIC_RELAXED);
+        }
         return (Object*)p;
     }
 
@@ -146,18 +159,54 @@ Object* Heap::Alloc(gc_alloc_context* ctx, size_t size, uint32_t flags)
     {
         uint8_t* p = BumpGlobal(size);
         if (p != nullptr)
+        {
             ctx->alloc_bytes += (int64_t)size;
+            __atomic_add_fetch(&s_totalAllocated, size, __ATOMIC_RELAXED);
+        }
         return (Object*)p;
     }
 
     uint8_t* chunk = BumpGlobal(ChunkSize);
     if (chunk == nullptr)
         return nullptr;
-    RetireContext(ctx);
+    RetireContext(ctx, true);
     ctx->alloc_ptr = chunk + size;
     ctx->alloc_limit = chunk + ChunkSize - min_obj_size;
     // The VM reports per-thread totals as alloc_bytes - (alloc_limit - alloc_ptr).
     ctx->alloc_bytes += (int64_t)(ctx->alloc_limit - chunk);
+    __atomic_add_fetch(&s_totalAllocated, (uint64_t)(ctx->alloc_limit - chunk), __ATOMIC_RELAXED);
     ctx->alloc_count++;
     return (Object*)chunk;
+}
+
+void Heap::RetireAllContexts()
+{
+    g_ee->GcEnumAllocContexts([](gc_alloc_context* ctx, void*) { RetireContext(ctx, true); }, nullptr);
+}
+
+void Heap::RebuildStartBits()
+{
+    size_t bytes = (BitIndex(s_next) / 64 + 1) * sizeof(uint64_t);
+    memset(s_startBits, 0, bytes);
+    memset(s_markBits, 0, bytes);
+    Walk([](uint8_t* obj, size_t, bool isFree) {
+        if (!isFree)
+            s_startBits[BitIndex(obj) >> 6] |= 1ull << (BitIndex(obj) & 63);
+    });
+}
+
+uint8_t* Heap::FindObject(const void* p)
+{
+    size_t bit = BitIndex(p);
+    size_t word = bit >> 6;
+    // Keep only bits at or below p, then search downwards for the nearest start.
+    uint64_t candidates = s_startBits[word] & (~0ull >> (63 - (bit & 63)));
+    while (candidates == 0)
+    {
+        if (word == 0)
+            return nullptr;
+        candidates = s_startBits[--word];
+    }
+    uint8_t* obj = s_base + (((word << 6) + (63 - (size_t)__builtin_clzll(candidates))) << 3);
+    return (const uint8_t*)p < obj + ObjectSize(obj) ? obj : nullptr;  // else p is in free space
 }

@@ -16,18 +16,18 @@ bool g_oldMethodTableFlags = false;
 
 static uint32_t s_eeMajorVersion;
 
-bool LogEnabled()
+int LogLevel()
 {
-    static const bool enabled = [] {
+    static const int level = [] {
         const char* value = getenv("MANUALGC_LOG");
-        return value != nullptr && strcmp(value, "0") != 0;
+        return value == nullptr ? 0 : atoi(value);
     }();
-    return enabled;
+    return level;
 }
 
 void LogLine(const char* format, ...)
 {
-    if (!LogEnabled())
+    if (LogLevel() == 0)
         return;
     char buffer[512];
     int prefix = snprintf(buffer, sizeof(buffer), "[manualgc %d] ", getpid());
@@ -36,6 +36,18 @@ void LogLine(const char* format, ...)
     vsnprintf(buffer + prefix, sizeof(buffer) - (size_t)prefix, format, args);
     va_end(args);
     fprintf(stderr, "%s\n", buffer);
+}
+
+void Fatal(const char* format, ...)
+{
+    char buffer[512] = "manualgc: ";
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), format, args);
+    va_end(args);
+    g_ee->LogErrorToHost(buffer);
+    g_ee->HandleFatalError(0x80131506);  // COR_E_EXECUTIONENGINE
+    abort();
 }
 
 GC_EXPORT void LOCALGC_CALLCONV GC_VersionInfo(VersionInfo* info)

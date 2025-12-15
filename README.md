@@ -1,10 +1,10 @@
 # manual-gc
 
 An experimental standalone GC for .NET 10.0.14 on macOS arm64, meant to be collected by hand.
-Stage 1 of 5: it allocates and never collects.
+Stage 2 of 5: it marks and logs on GC.Collect(), and frees nothing.
 
     make                 # builds artifacts/libmanualgc.dylib (Command Line Tools only)
-    tests/stage1.sh      # builds, runs the samples, checks the result
+    tests/stage1.sh      # each stage has a script that builds, runs the samples and checks the result
 
 To run another app, copy the dylib next to the app's dll and set `DOTNET_GCName=libmanualgc.dylib`.
 `DOTNET_GCName` must be a bare file name; with an absolute path the runtime itself crashes. Use

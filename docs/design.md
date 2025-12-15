@@ -1,7 +1,7 @@
 # Design
 
 Pinned to Microsoft.NETCore.App 10.0.14 on osx-arm64, GC interface 5.5, EE interface 4. Line
-references are to dotnet/runtime tag v10.0.14. Current as of Stage 1.
+references are to dotnet/runtime tag v10.0.14. Current as of Stage 2.
 
 ## Heap layout
 
@@ -15,8 +15,8 @@ references are to dotnet/runtime tag v10.0.14. Current as of Stage 1.
 
 - An object pointer points at the MethodTable slot. The 8-byte `ObjHeader` sits before it, so an
   object of size n at p owns `[p - 8, p + n - 8)`. Sizes round up to 8; the minimum is 24.
-- No header or MethodTable bits are used. Stage 2 will keep mark bits in a side bitmap, so that a
-  walk never alters live objects.
+- No header or MethodTable bits are used. Two side bitmaps, one bit per 8 bytes of heap each, hold
+  "an object starts here" and "marked". They are valid during a collection only.
 
 ## Allocation path
 
@@ -44,8 +44,8 @@ The mutex is taken in cooperative mode. Nothing inside it waits for the runtime.
 ## Handles
 
 32-byte slots in 64 KB chunks that never move, with the object first because the VM dereferences
-handles directly. One mutex and one free list. Every `HandleType` is stored with its type;
-collection-time behaviour arrives in Stage 2.
+handles directly. One mutex and one free list. Every slot records its `HandleType`. The collector
+walks slots without the lock, so EE callbacks made during the walk cannot deadlock.
 
 ## Suspension
 
@@ -59,7 +59,19 @@ Registration is accepted and forgotten. No finalizer runs.
 
 ## Collection sequence
 
-None yet (Stage 2).
+`GC.Collect()` and other blocking requests, on the calling thread:
+
+1. Leave cooperative mode, take the collection lock, `SuspendEE`, go back to cooperative mode.
+2. Retire every allocation context, so the heap is objects and free objects end to end.
+3. Walk the heap and rebuild the start bitmap; clear the mark bitmap.
+4. Mark from stacks and thread statics (`GcScanRoots`), strong, pinned and ref-counted handles,
+   then dependent handles until nothing changes. Marking uses an explicit stack. Objects of
+   collectible types also mark their LoaderAllocator.
+5. Log live and dead totals. Resume.
+
+An interior pointer is resolved by searching the start bitmap downwards. Any other reference that
+is not the start of an object ends the process: it means the heap is corrupt. Frozen objects count
+as live and are not scanned, as in the stock GC; they hold no references into this heap.
 
 ## Viewer protocol
 

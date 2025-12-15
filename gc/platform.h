@@ -15,6 +15,8 @@ static_assert(min_obj_size == 24, "minimum object size (gcinterface.h:250)");
 // Set from GC_Initialize.
 extern IGCToCLR* g_ee;
 
-// True when MANUALGC_LOG is set to anything but "0".
-bool LogEnabled();
+// MANUALGC_LOG: 0 off, 1 summaries, 2 also counts per type.
+int LogLevel();
 void LogLine(const char* format, ...) __attribute__((format(printf, 1, 2)));
+// Reports through the host and ends the process. For broken invariants only.
+[[noreturn]] void Fatal(const char* format, ...) __attribute__((format(printf, 1, 2)));

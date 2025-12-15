@@ -3,21 +3,12 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
+using namespace Handles;
+
 namespace
 {
-    constexpr size_t ChunkBytes = 64 * 1024;
-
-    struct HandleChunk
-    {
-        HandleChunk* next;
-        uint8_t pad[sizeof(HandleSlot) - sizeof(HandleChunk*)];
-        HandleSlot slots[(ChunkBytes / sizeof(HandleSlot)) - 1];
-    };
-    static_assert(sizeof(HandleChunk) == ChunkBytes, "handle chunk layout");
-    constexpr size_t SlotsPerChunk = sizeof(HandleChunk::slots) / sizeof(HandleSlot);
-
     pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
-    HandleChunk* s_chunks;
+    Chunk* s_chunks;
     HandleSlot* s_free;
     size_t s_live;
 
@@ -28,15 +19,15 @@ namespace
         void* p = mmap(nullptr, ChunkBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (p == MAP_FAILED)
             return false;
-        HandleChunk* chunk = (HandleChunk*)p;
+        Chunk* chunk = (Chunk*)p;
         chunk->next = s_chunks;
-        s_chunks = chunk;
         for (size_t i = SlotsPerChunk; i-- > 0;)
         {
             chunk->slots[i].type = HandleSlot::FreeType;
             chunk->slots[i].extraInfo = (uintptr_t)s_free;
             s_free = &chunk->slots[i];
         }
+        __atomic_store_n(&s_chunks, chunk, __ATOMIC_RELEASE);  // readers take no lock
         return true;
     }
 
@@ -53,7 +44,7 @@ namespace
         s_live++;
         slot->secondary = secondary;
         slot->extraInfo = (uintptr_t)extraInfo;
-        slot->type = (uint32_t)type;
+        __atomic_store_n(&slot->type, (uint32_t)type, __ATOMIC_RELEASE);
         __atomic_store_n(&slot->object, object, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&s_lock);
         return (OBJECTHANDLE)slot;
@@ -74,7 +65,7 @@ namespace
         }
         __atomic_store_n(&slot->object, (Object*)nullptr, __ATOMIC_RELEASE);
         slot->secondary = nullptr;
-        slot->type = HandleSlot::FreeType;
+        __atomic_store_n(&slot->type, HandleSlot::FreeType, __ATOMIC_RELEASE);
         slot->extraInfo = (uintptr_t)s_free;
         s_free = slot;
         s_live--;
@@ -88,15 +79,7 @@ namespace
     HandleStore* s_store;
 }
 
-void Handles::ForEach(SlotFn fn, void* context)
-{
-    pthread_mutex_lock(&s_lock);
-    for (HandleChunk* chunk = s_chunks; chunk != nullptr; chunk = chunk->next)
-        for (size_t i = 0; i < SlotsPerChunk; i++)
-            if (chunk->slots[i].type != HandleSlot::FreeType)
-                fn(&chunk->slots[i], context);
-    pthread_mutex_unlock(&s_lock);
-}
+Handles::Chunk* Handles::FirstChunk() { return __atomic_load_n(&s_chunks, __ATOMIC_ACQUIRE); }
 
 size_t Handles::LiveCount()
 {
@@ -117,7 +100,7 @@ bool HandleStore::ContainsHandle(OBJECTHANDLE handle)
 {
     bool found = false;
     pthread_mutex_lock(&s_lock);
-    for (HandleChunk* chunk = s_chunks; chunk != nullptr && !found; chunk = chunk->next)
+    for (Chunk* chunk = s_chunks; chunk != nullptr && !found; chunk = chunk->next)
         found = Slot(handle) >= chunk->slots && Slot(handle) < chunk->slots + SlotsPerChunk;
     pthread_mutex_unlock(&s_lock);
     return found;
@@ -213,24 +196,10 @@ HandleType HandleManager::HandleFetchType(OBJECTHANDLE handle)
     return (HandleType)Slot(handle)->type;
 }
 
-namespace
-{
-    struct RefCountedTrace
-    {
-        HANDLESCANPROC callback;
-        uintptr_t param1;
-        uintptr_t param2;
-    };
-}
-
 void HandleManager::TraceRefCountedHandles(HANDLESCANPROC callback, uintptr_t param1, uintptr_t param2)
 {
-    RefCountedTrace trace = {callback, param1, param2};
-    Handles::ForEach(
-        [](HandleSlot* slot, void* context) {
-            RefCountedTrace* t = (RefCountedTrace*)context;
-            if (slot->type == HNDTYPE_REFCOUNTED)
-                t->callback((PTR_UNCHECKED_OBJECTREF)&slot->object, &slot->extraInfo, t->param1, t->param2);
-        },
-        &trace);
+    Handles::ForEach([=](HandleSlot* slot, uint32_t type) {
+        if (type == HNDTYPE_REFCOUNTED)
+            callback((PTR_UNCHECKED_OBJECTREF)&slot->object, &slot->extraInfo, param1, param2);
+    });
 }

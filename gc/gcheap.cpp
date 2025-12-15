@@ -1,4 +1,5 @@
 #include "gcheap.h"
+#include "collector.h"
 #include "handles.h"
 #include "heap.h"
 
@@ -20,6 +21,7 @@ namespace
     pthread_mutex_t s_eventLock = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t s_eventCond = PTHREAD_COND_INITIALIZER;
     bool s_eventSignalled = true;
+    uint64_t s_eventSets;  // a waiter is released by any Set, even if a Reset follows before it runs
 
     // Values from GC.CoreCLR.cs / gcpriv.h pause modes: 0 batch (blocking), 4 no-GC region.
     int s_latencyMode = 0;
@@ -43,15 +45,6 @@ namespace
         size_t length = sizeof(bytes);
         sysctlbyname("hw.memsize", &bytes, &length, nullptr, 0);
         return bytes;
-    }
-
-    size_t ObjectSize(Object* obj)
-    {
-        MethodTable* mt = (MethodTable*)(*(uintptr_t*)obj & ~(uintptr_t)7);
-        size_t size = mt->GetBaseSize();
-        if (mt->HasComponentSize())
-            size += (size_t)mt->RawGetComponentSize() * *(uint32_t*)((uint8_t*)obj + sizeof(void*));
-        return (size + 7) & ~(size_t)7;
     }
 
     void LogStatistics()
@@ -159,9 +152,16 @@ int ManualGCHeap::EndNoGCRegion()
 }
 
 size_t ManualGCHeap::GetTotalBytesInUse() { return Heap::UsedBytes(); }
-uint64_t ManualGCHeap::GetTotalAllocatedBytes() { return Heap::UsedBytes(); }
+uint64_t ManualGCHeap::GetTotalAllocatedBytes() { return Heap::TotalAllocated(); }
 
-HRESULT ManualGCHeap::GarbageCollect(int, bool, int) { return S_OK; }
+HRESULT ManualGCHeap::GarbageCollect(int, bool, int mode)
+{
+    // Memory pressure requests from the VM are non-blocking (vm/comutilnative.cpp:1472). Only
+    // GC.Collect() and other explicit blocking requests are a person's decision.
+    if ((mode & collection_non_blocking) == 0)
+        Collector::Collect();
+    return S_OK;
+}
 
 unsigned ManualGCHeap::GetMaxGeneration() { return MaxGeneration; }
 int ManualGCHeap::GetLastGCPercentTimeInGC() { return 0; }
@@ -181,12 +181,12 @@ HRESULT ManualGCHeap::Initialize()
         return (HRESULT)E_OUTOFMEMORY;
     }
     LogLine("initialized, reserved %zu MB", Heap::ReservedBytes() >> 20);
-    if (LogEnabled())
+    if (LogLevel() > 0)
         atexit(LogStatistics);
     return S_OK;
 }
 
-bool ManualGCHeap::IsPromoted(Object*) { return true; }
+bool ManualGCHeap::IsPromoted(Object* object) { return Collector::IsPromoted(object); }
 
 bool ManualGCHeap::IsHeapPointer(void* object, bool) { return Heap::Contains(object); }
 unsigned ManualGCHeap::GetCondemnedGeneration() { return MaxGeneration; }
@@ -203,7 +203,8 @@ bool ManualGCHeap::IsEphemeral(Object*) { return false; }
 uint32_t ManualGCHeap::WaitUntilGCComplete(bool)
 {
     pthread_mutex_lock(&s_eventLock);
-    while (!s_eventSignalled)
+    uint64_t sets = s_eventSets;
+    while (!s_eventSignalled && s_eventSets == sets)
         pthread_cond_wait(&s_eventCond, &s_eventLock);
     pthread_mutex_unlock(&s_eventLock);
     return S_OK;
@@ -211,7 +212,7 @@ uint32_t ManualGCHeap::WaitUntilGCComplete(bool)
 
 void ManualGCHeap::FixAllocContext(gc_alloc_context* acontext, void*, void*)
 {
-    Heap::RetireContext(acontext);
+    Heap::RetireContext(acontext, false);
 }
 
 size_t ManualGCHeap::GetCurrentObjSize() { return Heap::UsedBytes(); }
@@ -247,6 +248,7 @@ void ManualGCHeap::SetWaitForGCEvent()
 {
     pthread_mutex_lock(&s_eventLock);
     s_eventSignalled = true;
+    s_eventSets++;
     pthread_cond_broadcast(&s_eventCond);
     pthread_mutex_unlock(&s_eventLock);
 }
@@ -265,8 +267,16 @@ bool ManualGCHeap::IsLargeObject(Object* pObj)
 }
 
 void ManualGCHeap::ValidateObjectMember(Object*) {}
-Object* ManualGCHeap::NextObj(Object*) { return nullptr; }
-Object* ManualGCHeap::GetContainingObject(void*, bool) { return nullptr; }
+
+Object* ManualGCHeap::NextObj(Object* object)
+{
+    if (!Heap::Contains(object))
+        return nullptr;
+    uint8_t* next = (uint8_t*)object + ObjectSize(object);
+    return next < Heap::FirstObject() + Heap::UsedBytes() ? (Object*)next : nullptr;
+}
+
+Object* ManualGCHeap::GetContainingObject(void* pInteriorPtr, bool) { return Collector::FindObject(pInteriorPtr); }
 
 // ---- Profiling and tracing ----
 void ManualGCHeap::DiagWalkObject(Object*, walk_fn, void*) {}

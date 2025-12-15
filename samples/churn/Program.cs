@@ -1,6 +1,6 @@
 // Allocates several hundred MB in many shapes and checks the data afterwards. Exits 1 if a
 // check fails. First argument: megabytes to allocate in the main workload (default 400), or
-// "oom" to fill the heap with live arrays and catch the OutOfMemoryException.
+// "collect" for 60 MB with two threads calling GC.Collect() alongside, or "oom" to fill the heap with live arrays and catch the OutOfMemoryException.
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -20,8 +20,20 @@ if (args is ["oom"])
     }
 }
 
-int megabytes = args.Length > 0 ? int.Parse(args[0]) : 400;
+int megabytes = args.Length > 0 && int.TryParse(args[0], out int requested) ? requested : args is ["collect"] ? 60 : 400;
 int failures = 0;
+int collections = 0;
+bool workDone = false;
+var collectors = Enumerable.Range(0, args is ["collect"] ? 2 : 0).Select(_ => new Thread(() =>
+{
+    for (int i = 0; i < 500 && !Volatile.Read(ref workDone); i++)
+    {
+        GC.Collect();
+        Interlocked.Increment(ref collections);
+        Thread.Sleep(5);  // with no gap, other threads starve (also on the stock GC)
+    }
+})).ToList();
+collectors.ForEach(c => c.Start());
 
 void Check(bool condition, string what)
 {
@@ -140,6 +152,9 @@ GC.Collect();
 GC.WaitForPendingFinalizers();
 Check(GC.CollectionCount(0) == 0 && Finalizable.Runs == 0, "GC.Collect is a no-op, finalizers do not run");
 Check(GC.GetTotalMemory(false) > megabytes * 1024L * 1024, $"heap grew to {GC.GetTotalMemory(false) >> 20} MB");
+Volatile.Write(ref workDone, true);
+collectors.ForEach(c => c.Join());
+Console.WriteLine($"collections requested: {collections + 1}");
 GC.KeepAlive(large); GC.KeepAlive(handles);
 return failures == 0 ? 0 : 1;
 

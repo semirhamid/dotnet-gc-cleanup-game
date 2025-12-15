@@ -53,9 +53,35 @@ public:
 
 namespace Handles
 {
-    // Calls fn for every live slot.
-    typedef void (*SlotFn)(HandleSlot* slot, void* context);
-    void ForEach(SlotFn fn, void* context);
+    static constexpr size_t ChunkBytes = 64 * 1024;
+
+    struct Chunk
+    {
+        Chunk* next;
+        uint8_t pad[sizeof(HandleSlot) - sizeof(Chunk*)];
+        HandleSlot slots[(ChunkBytes / sizeof(HandleSlot)) - 1];
+    };
+    static_assert(sizeof(Chunk) == ChunkBytes, "handle chunk layout");
+    static constexpr size_t SlotsPerChunk = sizeof(Chunk::slots) / sizeof(HandleSlot);
+
+    Chunk* FirstChunk();
+
+    // Calls fn(HandleSlot*, uint32_t type) for every slot holding an object. Takes no lock, so fn
+    // may call into the EE. Chunks are never freed. Threads in preemptive mode can still create
+    // and destroy handles during a collection, but only with null objects, which are skipped.
+    template <typename Fn>
+    void ForEach(Fn fn)
+    {
+        for (Chunk* chunk = FirstChunk(); chunk != nullptr; chunk = chunk->next)
+        {
+            for (HandleSlot& slot : chunk->slots)
+            {
+                uint32_t type = __atomic_load_n(&slot.type, __ATOMIC_ACQUIRE);
+                if (type != HandleSlot::FreeType && __atomic_load_n(&slot.object, __ATOMIC_ACQUIRE) != nullptr)
+                    fn(&slot, type);
+            }
+        }
+    }
 
     size_t LiveCount();
     HandleManager* CreateManager();
