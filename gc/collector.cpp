@@ -1,10 +1,13 @@
 #include "collector.h"
 #include "handles.h"
 #include "heap.h"
+#include "link.h"
+#include "typeinfo.h"
 
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 namespace
 {
@@ -181,6 +184,62 @@ namespace
                 live.bytes + dead.bytes + free.bytes, Heap::UsedBytes());
     }
 
+    ViewerLink s_link;
+    TypeDescriber s_types;
+
+    void SendSnapshot()
+    {
+        s_types.Reset();
+        s_link.Begin(1);
+        s_link.U32(1);
+        s_link.U32((uint32_t)getpid());
+        s_link.U32(s_collections);
+        s_link.U64((uint64_t)Heap::FirstObject());
+        s_link.U64((uint64_t)Heap::FirstObject() + Heap::UsedBytes());
+        s_link.U8(0);
+        s_link.End();
+
+        // Types are sent before the objects that use them, so each batch needs two passes.
+        struct Item
+        {
+            uint8_t* obj;
+            size_t size;
+            bool isFree;
+        };
+        static Item batch[4096];
+        size_t count = 0;
+        uint64_t total = 0;
+        auto sendBatch = [&] {
+            for (size_t i = 0; i < count; i++)
+                if (!batch[i].isFree)
+                    s_types.Send(s_link, MethodTableOf(batch[i].obj));
+            s_link.Begin(4);
+            for (size_t i = 0; i < count; i++)
+            {
+                const Item& item = batch[i];
+                uint64_t flags = item.isFree ? 2 : Heap::IsMarked(item.obj) ? 1 : 0;
+                s_link.U64((uint64_t)item.obj);
+                s_link.U64(item.size | flags);
+                s_link.U64(item.isFree ? 0 : (uint64_t)MethodTableOf(item.obj));
+            }
+            s_link.End();
+            total += count;
+            count = 0;
+        };
+        Heap::Walk([&](uint8_t* obj, size_t size, bool isFree) {
+            batch[count++] = {obj, size, isFree};
+            if (count == sizeof(batch) / sizeof(batch[0]))
+                sendBatch();
+        });
+        if (count > 0)
+            sendBatch();
+        s_link.Begin(5);
+        s_link.U64(total);
+        s_link.End();
+        s_link.Flush();
+        s_types.Free();
+    }
+
     void CollectSuspended()
     {
         s_collections++;
@@ -195,6 +254,8 @@ namespace
             LogCensus();
             LogLine("gc %u marked in %.1f ms", s_collections, (double)(marked - start) / 1e6);
         }
+        if (s_link.Connected())
+            SendSnapshot();
         s_marking = false;
     }
 }
@@ -216,12 +277,21 @@ void Collector::Collect()
     // because that collection could never suspend this thread.
     bool wasCooperative = g_ee->EnablePreemptiveGC();
     pthread_mutex_lock(&s_collectLock);
+    // Without a viewer there is nobody to collect, unless the log wants the census.
+    if (!s_link.Connect() && LogLevel() == 0)
+    {
+        pthread_mutex_unlock(&s_collectLock);
+        if (wasCooperative)
+            g_ee->DisablePreemptiveGC();
+        return;
+    }
     g_ee->SuspendEE(SUSPEND_FOR_GC);
     if (wasCooperative)
         g_ee->DisablePreemptiveGC();
 
     CollectSuspended();
 
+    s_link.Close();
     g_ee->RestartEE(true);
     pthread_mutex_unlock(&s_collectLock);
 }

@@ -1,7 +1,7 @@
 # Design
 
 Pinned to Microsoft.NETCore.App 10.0.14 on osx-arm64, GC interface 5.5, EE interface 4. Line
-references are to dotnet/runtime tag v10.0.14. Current as of Stage 2.
+references are to dotnet/runtime tag v10.0.14. Current as of Stage 3.
 
 ## Heap layout
 
@@ -75,5 +75,14 @@ as live and are not scanned, as in the stock GC; they hold no references into th
 
 ## Viewer protocol
 
-None yet (Stage 3). Open question: `IGCToCLR` has no way to get a type name, and the GC must not
-run managed code. Proposal: the sample sends the viewer a MethodTable-to-name map.
+See [protocol.md](protocol.md). The GC connects before suspending the runtime. With no viewer
+listening and no log wanted, a collection returns without doing anything. Socket I/O happens on the
+collecting thread while the app is suspended.
+
+## Type names
+
+`IGCToCLR` has no way to name a type. coreclr exports `DotNetRuntimeContractDescriptor`, which gives
+the field offsets diagnostic tools use. The GC reads those offsets at run time and sends each type
+as a module path and TypeDef token, with generic arguments and array elements resolved to other
+types. The viewer looks the names up in the assemblies' metadata. If the descriptor is missing or
+incomplete, types appear by address. Types from in-memory assemblies have no file, so they do too.

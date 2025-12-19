@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Heap</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1 id="title">Waiting for an app to call GC.Collect()</h1>
+    <p id="subtitle">Start an app with DOTNET_GCName=libmanualgc.dylib.</p>
+    <div id="controls">
+      <label>Bytes per block <select id="scale"></select></label>
+      <label><input type="checkbox" id="reveal"> Show what is alive</label>
+    </div>
+  </header>
+  <main>
+    <div id="map" tabindex="0" aria-label="Heap map">
+      <div id="spacer"></div>
+      <canvas id="canvas"></canvas>
+    </div>
+    <aside>
+      <h2>Types by size</h2>
+      <p class="hint">Click a type to show only its objects.</p>
+      <div id="legend"></div>
+    </aside>
+  </main>
+  <div id="tooltip" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
