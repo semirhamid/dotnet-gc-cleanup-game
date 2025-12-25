@@ -36,3 +36,9 @@ aside { width: 320px; padding: 12px; overflow-y: auto; border-left: 1px solid va
 #tooltip { position: fixed; z-index: 2; pointer-events: none; max-width: 420px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: 0 2px 8px #0003; font-size: 12px; overflow-wrap: anywhere; }
 #tooltip b { display: block; }
 @media (max-width: 700px) { main { flex-direction: column; } aside { width: auto; max-height: 35vh; border-left: 0; border-top: 1px solid var(--line); } }
+#done { padding: 6px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+#done:disabled { background: var(--dim); color: var(--text-2); cursor: default; }
+#lives { font-size: 16px; letter-spacing: 2px; }
+#lives .lost { opacity: .3; }
+#toast { position: fixed; left: 24px; bottom: 24px; z-index: 2; padding: 10px 14px; border-left: 4px solid var(--critical); border-radius: 6px; background: var(--surface); box-shadow: 0 2px 8px #0005; }
+#map.playing { cursor: crosshair; touch-action: none; }

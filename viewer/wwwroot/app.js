@@ -6,6 +6,8 @@ const CELL = 10, GAP = 1;
 let info = null;            // the snapshot message
 let offsets, sizes, types;  // Uint32Array, in units of 8 bytes; type 0 is free space
 let live = null;            // Uint8Array once revealed
+let knownLive = new Set();  // blocks the GC refused to free
+let state = null;           // lives and bytes freed this round
 let columns = 1, unitsPerCell = 4;
 let isolated = -1;          // type index, or -1 for all
 let colors = [];            // per type index
@@ -70,12 +72,36 @@ function showSnapshot(frame) {
   sizes = words.slice(2 + n, 2 + 2 * n);
   types = words.slice(2 + 2 * n, 2 + 3 * n);
   live = null;
+  knownLive = new Set(info.knownLive);
   isolated = -1;
+  asked.clear();
   $('reveal').checked = false;
   fillScale();
   applyColors();
   layout();
   updateTitle();
+  updateState(info.state);
+}
+
+function updateState(next) {
+  state = next;
+  const lives = $('lives');
+  lives.textContent = '';
+  lives.setAttribute('aria-label', `${state.lives} of ${state.maxLives} lives`);
+  lives.append('♥'.repeat(state.lives), Object.assign(document.createElement('span'), { className: 'lost', textContent: '♡'.repeat(state.maxLives - state.lives) }));
+  $('score').textContent = `${bytes(state.freedBytes)} freed from ${state.freedCount.toLocaleString()} object${state.freedCount === 1 ? '' : 's'}`;
+  $('done').disabled = !info.frozen;
+  map.classList.toggle('playing', canErase());
+}
+
+const canErase = () => info?.frozen && state?.lives > 0;
+
+let toastTimer;
+function toast(text) {
+  $('toast').textContent = text;
+  $('toast').hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { $('toast').hidden = true; }, 2500);
 }
 
 function updateTitle() {
@@ -157,7 +183,7 @@ function paint() {
       const from = Math.max(first, row * columns) - row * columns;
       const to = Math.min(last, row * columns + columns - 1) - row * columns;
       context.fillRect(from * CELL, row * CELL - top, (to - from + 1) * CELL - GAP, CELL - GAP);
-      if (live && live[i]) {
+      if (knownLive.has(i) || live && live[i]) {
         // Live blocks carry a mark as well as their colour.
         context.fillStyle = css_text;
         context.fillRect(from * CELL + 3, row * CELL - top + 3, 3, 3);
@@ -188,11 +214,63 @@ function showTooltip(event) {
   tip.textContent = '';
   const address = BigInt(info.heapBase) + BigInt(offsets[i]) * 8n;
   const lines = [`${(sizes[i] * 8).toLocaleString()} bytes at 0x${address.toString(16)}`];
-  if (live && types[i] !== 0) lines.push(live[i] ? 'alive' : 'dead');
+  if (knownLive.has(i)) lines.push('alive');
+  else if (live && types[i] !== 0) lines.push(live[i] ? 'alive' : 'dead');
   tip.append(Object.assign(document.createElement('b'), { textContent: info.types[types[i]] }), lines.join(' · '));
   tip.style.left = `${Math.min(event.clientX + 14, innerWidth - tip.offsetWidth - 8)}px`;
   tip.style.top = `${Math.min(event.clientY + 14, innerHeight - tip.offsetHeight - 8)}px`;
 }
+
+// ---- Eraser ----
+
+const asked = new Set();  // sent this round, so a drag does not repeat itself
+let erasing = false, pending = [], lastPoint = null;
+
+function eraseAt(x, y) {
+  const r = Number($('radius').value);
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const i = blockUnder(x + dx * CELL, y + dy * CELL);
+      if (i < 0 || types[i] === 0 || asked.has(i) || knownLive.has(i)) continue;
+      if (isolated >= 0 && types[i] !== isolated) continue;  // dimmed blocks are out of reach
+      asked.add(i);
+      pending.push(i);
+    }
+  }
+}
+
+// Fast drags skip pixels, so fill in the line between two pointer events.
+function eraseTo(event) {
+  const box = map.getBoundingClientRect();
+  const x = event.clientX - box.left, y = event.clientY - box.top;
+  const from = lastPoint ?? { x, y };
+  const steps = Math.max(1, Math.ceil(Math.hypot(x - from.x, y - from.y) / (CELL / 2)));
+  for (let s = 1; s <= steps; s++) eraseAt(from.x + (x - from.x) * s / steps, from.y + (y - from.y) * s / steps);
+  lastPoint = { x, y };
+}
+
+// Blocks touched in the same frame go together.
+function flushErase() {
+  if (pending.length > 0) {
+    send({ type: 'erase', blocks: pending.slice(0, 4000) });
+    pending = pending.slice(4000);
+  }
+  if (erasing || pending.length > 0) requestAnimationFrame(flushErase);
+}
+
+map.addEventListener('pointerdown', event => {
+  const box = map.getBoundingClientRect();
+  if (event.button !== 0 || !canErase() || event.clientX - box.left >= map.clientWidth) return;  // not the scrollbar
+  map.setPointerCapture(event.pointerId);
+  erasing = true;
+  lastPoint = null;
+  eraseTo(event);
+  requestAnimationFrame(flushErase);
+});
+map.addEventListener('pointermove', event => { if (erasing && canErase()) eraseTo(event); });
+for (const name of ['pointerup', 'pointercancel']) map.addEventListener(name, () => { erasing = false; });
+$('done').onclick = () => { $('done').disabled = true; send({ type: 'done' }); };
 
 map.addEventListener('pointermove', showTooltip);
 map.addEventListener('pointerleave', () => { $('tooltip').hidden = true; });
@@ -212,7 +290,25 @@ function send(message) { if (socket?.readyState === WebSocket.OPEN) socket.send(
 
 const handlers = {
   snapshot(message) { info = message; },
-  resumed() { if (info) { info.frozen = false; updateTitle(); } },
+  resumed(message) {
+    if (!info) return;
+    info.frozen = false;
+    erasing = false;
+    updateTitle();
+    updateState(message.state);
+  },
+  erased(message) {
+    for (const i of message.freed) { types[i] = 0; asked.delete(i); if (live) live[i] = 0; }
+    for (const i of message.live) { knownLive.add(i); asked.delete(i); }
+    const before = state.lives;
+    updateState(message.state);
+    if (message.live.length > 0) {
+      const name = info.types[types[message.live[0]]];
+      toast(state.lives === 0 ? `${name} is in use. No lives left; press Done.` : `${name} is in use. ${before - state.lives === 1 ? 'One life lost.' : `${before - state.lives} lives lost.`}`);
+      pending = [];
+    }
+    draw();
+  },
 };
 
 function connect() {

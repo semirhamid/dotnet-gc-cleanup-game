@@ -1,7 +1,8 @@
 # GC to viewer protocol, version 1
 
 The GC connects to `127.0.0.1:5710` (`MANUALGC_PORT`; 0 turns the viewer off) each time it
-collects, and closes the connection when the app resumes. If nothing is listening, the collection
+collects, and closes the connection when the app resumes. The app stays suspended from before Hello
+until the viewer sends Done or closes the connection. If nothing is listening, the collection
 is a no-op.
 
 Every message is a little-endian `u32` length, then that many bytes: a `u8` type and the payload.
@@ -16,6 +17,7 @@ Integers are little-endian. Strings are UTF-8.
 | 3 | Type | `u64` type id, `u8` kind, then by kind (below) |
 | 4 | Objects | repeated: `u64` address, `u64` size with flags in its low 3 bits (bit 0 live, bit 1 free space), `u64` type id (0 for free space) |
 | 5 | SnapshotEnd | `u64` number of entries sent |
+| 6 | EraseResults | repeated: `u64` address, `u8` status (0 freed, 1 refused because it is alive, 2 not an object). Answers one Erase, in order |
 
 Type kinds:
 
@@ -31,3 +33,14 @@ Type ids are addresses in the app, meaningful only within one connection. A modu
 before the first message that refers to it. Names are not sent: the viewer reads them from the
 assembly's metadata, so the GC neither runs managed code nor parses metadata. Objects arrive in address
 order and cover the whole heap.
+
+## Viewer to GC
+
+| Type | Name | Payload |
+|---|---|---|
+| 64 | Erase | `u32` count, that many `u64` object addresses |
+| 65 | Done | empty |
+
+Messages to the GC are at most 64 KB, so at most 8,000 addresses per Erase. The GC decides for
+itself what is alive; the flags in Objects are for display. A malformed message ends the collection
+and the app resumes.

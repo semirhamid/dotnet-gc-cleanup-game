@@ -1,33 +1,35 @@
 using System.Net.WebSockets;
 using System.Text.Json;
+using System.Threading.Channels;
 
 namespace ManualGC.Viewer;
 
-/// <summary>One connected page. Sends are serialized because a WebSocket allows only one at a time.</summary>
+/// <summary>
+/// One connected page. Messages go through a queue, so a page that reads slowly holds up neither the
+/// session nor the suspended app.
+/// </summary>
 sealed class Browser(WebSocket socket)
 {
-    readonly SemaphoreSlim _sending = new(1);
+    readonly Channel<(byte[] Data, WebSocketMessageType Type)> _queue =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType)>(new() { SingleReader = true });
 
-    public Task SendAsync(object message) =>
-        SendAsync(JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web), WebSocketMessageType.Text);
+    public void Send(object message) =>
+        _queue.Writer.TryWrite((JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web), WebSocketMessageType.Text));
 
-    public Task SendAsync(byte[] frame) => SendAsync(frame, WebSocketMessageType.Binary);
+    public void Send(byte[] frame) => _queue.Writer.TryWrite((frame, WebSocketMessageType.Binary));
 
-    async Task SendAsync(byte[] data, WebSocketMessageType type)
+    public void Close() => _queue.Writer.TryComplete();
+
+    public async Task PumpAsync()
     {
-        await _sending.WaitAsync();
         try
         {
-            if (socket.State == WebSocketState.Open)
+            await foreach (var (data, type) in _queue.Reader.ReadAllAsync())
                 await socket.SendAsync(data, type, endOfMessage: true, CancellationToken.None);
         }
         catch (Exception e) when (e is WebSocketException or ObjectDisposedException or OperationCanceledException)
         {
-            // The page went away; its receive loop removes it.
-        }
-        finally
-        {
-            _sending.Release();
+            // The page went away; its receive loop notices.
         }
     }
 }
@@ -36,8 +38,15 @@ sealed class Browsers
 {
     readonly List<Browser> _all = [];
 
-    public Task SendAsync(object message) => Task.WhenAll(Current().Select(b => b.SendAsync(message)));
-    public Task SendAsync(byte[] frame) => Task.WhenAll(Current().Select(b => b.SendAsync(frame)));
+    public void Send(object message)
+    {
+        foreach (Browser browser in Current()) browser.Send(message);
+    }
+
+    public void Send(byte[] frame)
+    {
+        foreach (Browser browser in Current()) browser.Send(frame);
+    }
 
     Browser[] Current()
     {
@@ -47,6 +56,7 @@ sealed class Browsers
     public async Task RunAsync(WebSocket socket, Session session, CancellationToken stop)
     {
         var browser = new Browser(socket);
+        Task pump = browser.PumpAsync();
         await session.JoinAsync(browser, () => { lock (_all) _all.Add(browser); });
         try
         {
@@ -63,10 +73,7 @@ sealed class Browsers
                     length += result.Count;
                 } while (!result.EndOfMessage);
                 if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                     return;
-                }
                 using var message = JsonDocument.Parse(buffer.AsMemory(0, length));
                 await session.HandleAsync(browser, message.RootElement);
             }
@@ -77,6 +84,8 @@ sealed class Browsers
         finally
         {
             lock (_all) _all.Remove(browser);
+            browser.Close();
+            await pump.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         }
     }
 }

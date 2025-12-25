@@ -38,6 +38,20 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
         _live.Add((sizeAndFlags & 1) != 0);
     }
 
+    /// <summary>Index of the block at an address, or -1.</summary>
+    public int Find(ulong address)
+    {
+        int i = address < heapBase ? -1 : _offsets.BinarySearch((uint)((address - heapBase) >> 3));
+        return i < 0 ? -1 : i;
+    }
+
+    /// <summary>Records that the GC freed a block.</summary>
+    public void SetFree(int i)
+    {
+        _types[i] = 0;
+        _live[i] = false;
+    }
+
     public bool IsFree(int i) => _types[i] == 0;
     public bool IsLive(int i) => _live[i];
     public ulong Address(int i) => heapBase + ((ulong)_offsets[i] << 3);

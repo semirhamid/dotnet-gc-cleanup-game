@@ -11,6 +11,16 @@ namespace Collector
     // True for objects outside the heap, and for every object outside a collection.
     bool IsPromoted(Object* obj);
 
+    // Collections a person has finished, and what the last one left behind.
+    struct Totals
+    {
+        unsigned collections;
+        uint64_t heapBytes;   // live and unerased dead objects
+        uint64_t freeBytes;
+        uint64_t pauseNanoseconds;  // all collections together
+    };
+    Totals GetTotals();
+
     // The object containing p, or null. Only answers during a collection.
     Object* FindObject(void* p);
 }

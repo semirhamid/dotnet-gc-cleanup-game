@@ -22,9 +22,16 @@ public:
     void End();
     void Flush();
 
+    // Blocks until a whole message arrives, then returns its type and payload. The payload stays
+    // valid until the next call. Returns 0 when the viewer is gone.
+    uint8_t Receive(const uint8_t** payload, size_t* size);
+
 private:
+    bool Read(void* data, size_t size);
+
     int m_socket = -1;
     size_t m_used = 0;
     size_t m_messageStart = 0;
     uint8_t m_buffer[256 * 1024];
+    uint8_t m_received[64 * 1024];
 };

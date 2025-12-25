@@ -18,6 +18,7 @@ builder.Services.AddHostFiltering(_ => { });
 builder.Services.AddSingleton<Browsers>();
 builder.Services.AddSingleton<Session>();
 builder.Services.AddSingleton(new GcPort(gcPort));
+builder.Services.AddSingleton(new GameRules(Lives: builder.Configuration.GetValue("Lives", 3)));
 builder.Services.AddHostedService<GcServer>();
 
 var app = builder.Build();

@@ -95,7 +95,13 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
                         throw new InvalidDataException($"got {snapshot.Count} of {count} objects");
                     log.LogInformation("Collection {Gc} of process {Pid}: {Count} entries, {Bytes:N0} bytes",
                         snapshot.Gc, snapshot.Pid, snapshot.Count, snapshot.End - snapshot.Base);
-                    await session.BeginAsync(snapshot);
+                    await session.BeginAsync(snapshot, stream);
+                    break;
+                case 6:
+                    var results = new List<(ulong Address, byte Status)>();
+                    while (reader.Remaining > 0)
+                        results.Add((reader.U64(), reader.U8()));
+                    await session.OnErasedAsync(results);
                     break;
                 default:
                     throw new InvalidDataException($"unknown message {type}");

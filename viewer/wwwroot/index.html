@@ -11,6 +11,10 @@
     <h1 id="title">Waiting for an app to call GC.Collect()</h1>
     <p id="subtitle">Start an app with DOTNET_GCName=libmanualgc.dylib.</p>
     <div id="controls">
+      <span id="lives" role="status"></span>
+      <span id="score" role="status"></span>
+      <button id="done" disabled>Done: resume the app</button>
+      <label>Eraser <input type="range" id="radius" min="0" max="8" value="0"></label>
       <label>Bytes per block <select id="scale"></select></label>
       <label><input type="checkbox" id="reveal"> Show what is alive</label>
     </div>
@@ -19,6 +23,7 @@
     <div id="map" tabindex="0" aria-label="Heap map">
       <div id="spacer"></div>
       <canvas id="canvas"></canvas>
+      <div id="toast" role="alert" hidden></div>
     </div>
     <aside>
       <h2>Types by size</h2>

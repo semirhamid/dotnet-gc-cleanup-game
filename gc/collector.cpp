@@ -121,15 +121,58 @@ namespace
         }
     }
 
-    void MarkFromRoots()
+    ScanContext MakeScanContext()
     {
         ScanContext sc;  // gcinterface.h:1121
         sc.promotion = true;
         sc.thread_number = 0;
         sc.thread_count = 1;
+        return sc;
+    }
+
+    void MarkFromRoots(ScanContext& sc)
+    {
         g_ee->GcScanRoots(Promote, MaxGeneration, MaxGeneration, &sc);
         MarkHandles(&sc);
         MarkDependentHandles();
+    }
+
+    void ClearIfDead(Object** slot)
+    {
+        if (!Collector::IsPromoted(*slot))
+            __atomic_store_n(slot, (Object*)nullptr, __ATOMIC_RELEASE);
+    }
+
+    // Cuts every path by which the app could still get at a dead object. After this a dead object
+    // stays dead, so references between dead objects may dangle without harm. The order is the
+    // stock GC's; its finalization step, between short and long weak handles, does not exist here.
+    void SeverDead(ScanContext& sc)
+    {
+        Handles::ForEach([](HandleSlot* slot, uint32_t type) {
+            switch (type)
+            {
+            case HNDTYPE_WEAK_SHORT:
+            case HNDTYPE_WEAK_NATIVE_COM:
+            case HNDTYPE_WEAK_LONG:
+            case HNDTYPE_REFCOUNTED:
+            case HNDTYPE_WEAK_INTERIOR_POINTER:
+                ClearIfDead(&slot->object);
+                break;
+            case HNDTYPE_DEPENDENT:
+                if (!Collector::IsPromoted(slot->object))
+                {
+                    __atomic_store_n(&slot->object, (Object*)nullptr, __ATOMIC_RELEASE);
+                    __atomic_store_n(&slot->secondary, (Object*)nullptr, __ATOMIC_RELEASE);
+                }
+                break;
+            default:
+                break;
+            }
+        });
+        g_ee->SyncBlockCacheWeakPtrScan(
+            [](PTR_UNCHECKED_OBJECTREF slot, uintptr_t*, uintptr_t, uintptr_t) { ClearIfDead((Object**)slot); },
+            (uintptr_t)&sc, 0);
+        g_ee->SyncBlockCachePromotionsGranted(MaxGeneration);
     }
 
     struct Tally
@@ -240,25 +283,112 @@ namespace
         s_types.Free();
     }
 
+    Collector::Totals s_totals;
+    struct
+    {
+        size_t count;
+        size_t bytes;
+        size_t refused;
+    } s_erased;
+
+    enum EraseStatus : uint8_t
+    {
+        Freed = 0,
+        Alive = 1,
+        NotAnObject = 2,
+    };
+
+    EraseStatus EraseAt(uint64_t address)
+    {
+        uint8_t* obj = (uint8_t*)address;
+        if (!Heap::Contains(obj) || !Heap::IsObjectStart(obj))
+            return NotAnObject;
+        if (Heap::IsMarked(obj))
+        {
+            s_erased.refused++;
+            return Alive;
+        }
+        s_erased.count++;
+        s_erased.bytes += ObjectSize(obj);
+        Heap::Erase(obj);
+        return Freed;
+    }
+
+    // Serves the player until they are done or the viewer goes away.
+    void Play()
+    {
+        s_erased = {};
+        const uint8_t* payload;
+        size_t size;
+        while (uint8_t type = s_link.Receive(&payload, &size))
+        {
+            if (type == 65)
+                return;
+            uint32_t count = 0;
+            if (type == 64 && size >= sizeof(count))
+                memcpy(&count, payload, sizeof(count));
+            if (type != 64 || size != sizeof(count) + count * sizeof(uint64_t))
+            {
+                LogLine("bad message %u from the viewer; resuming the app", type);
+                return;
+            }
+            s_link.Begin(6);
+            for (uint32_t i = 0; i < count; i++)
+            {
+                uint64_t address;
+                memcpy(&address, payload + sizeof(count) + i * sizeof(address), sizeof(address));
+                s_link.U64(address);
+                s_link.U8(EraseAt(address));
+            }
+            s_link.End();
+            s_link.Flush();
+        }
+    }
+
     void CollectSuspended()
     {
-        s_collections++;
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        bool playing = s_link.Connected();
+        s_collections++;
         Heap::RetireAllContexts();
         Heap::RebuildStartBits();
+
+        ScanContext sc = MakeScanContext();
+        if (playing)
+        {
+            g_ee->GcStartWork(MaxGeneration, MaxGeneration);
+            g_ee->BeforeGcScanRoots(MaxGeneration, false, false);
+        }
         s_marking = true;
-        MarkFromRoots();
+        MarkFromRoots(sc);
         uint64_t marked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (LogLevel() > 0)
         {
             LogCensus();
             LogLine("gc %u marked in %.1f ms", s_collections, (double)(marked - start) / 1e6);
         }
-        if (s_link.Connected())
+        // Without a player this was only a census, and the app must not notice it.
+        if (playing)
+        {
+            g_ee->AfterGcScanRoots(MaxGeneration, MaxGeneration, &sc);
+            SeverDead(sc);
             SendSnapshot();
+            Play();
+            Heap::Sweep();
+            s_totals.collections++;
+            s_totals.freeBytes = Heap::FreeListBytes();
+            s_totals.heapBytes = Heap::UsedBytes() - s_totals.freeBytes;
+            s_totals.pauseNanoseconds += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+            LogLine("gc %u erased %zu objects %zu bytes, refused %zu, reusable %zu bytes", s_collections,
+                    s_erased.count, s_erased.bytes, s_erased.refused, Heap::FreeListBytes());
+        }
         s_marking = false;
+        if (playing)
+            g_ee->GcDone(MaxGeneration);
     }
 }
+
+Collector::Totals Collector::GetTotals() { return s_totals; }
 
 bool Collector::IsPromoted(Object* obj)
 {

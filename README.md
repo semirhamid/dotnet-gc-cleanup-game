@@ -1,7 +1,7 @@
 # manual-gc
 
 An experimental standalone GC for .NET 10.0.14 on macOS arm64, meant to be collected by hand.
-Stage 3 of 5: GC.Collect() shows the heap in a web page, and frees nothing.
+Stage 4 of 5: GC.Collect() pauses the app and shows its heap in a web page, where you erase garbage.
 
     make                 # builds artifacts/libmanualgc.dylib (Command Line Tools only)
     tests/stage1.sh      # each stage has a script that builds, runs the samples and checks the result

@@ -89,3 +89,41 @@ void ViewerLink::Flush()
     }
     m_used = 0;
 }
+
+bool ViewerLink::Read(void* data, size_t size)
+{
+    uint8_t* at = (uint8_t*)data;
+    while (m_socket >= 0 && size > 0)
+    {
+        ssize_t n = recv(m_socket, at, size, 0);
+        if (n > 0)
+        {
+            at += n;
+            size -= (size_t)n;
+        }
+        else if (n == 0 || errno != EINTR)
+        {
+            LogLine("the viewer is gone; resuming the app");
+            Close();
+        }
+    }
+    return m_socket >= 0;
+}
+
+uint8_t ViewerLink::Receive(const uint8_t** payload, size_t* size)
+{
+    uint32_t length;
+    if (!Read(&length, sizeof(length)))
+        return 0;
+    if (length < 1 || length > sizeof(m_received))
+    {
+        LogLine("bad message length %u from the viewer; resuming the app", length);
+        Close();
+        return 0;
+    }
+    if (!Read(m_received, length))
+        return 0;
+    *payload = m_received + 1;
+    *size = length - 1;
+    return m_received[0];
+}

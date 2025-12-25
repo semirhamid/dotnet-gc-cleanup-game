@@ -1,13 +1,14 @@
 # Design
 
 Pinned to Microsoft.NETCore.App 10.0.14 on osx-arm64, GC interface 5.5, EE interface 4. Line
-references are to dotnet/runtime tag v10.0.14. Current as of Stage 3.
+references are to dotnet/runtime tag v10.0.14. Current as of Stage 4.
 
 ## Heap layout
 
 - One contiguous reservation, 32 GB by default or `DOTNET_GCHeapHardLimit` (hexadecimal bytes),
   aligned to 16 MB. Address space only; pages are made accessible in 16 MB steps.
-- A bump pointer hands out space and never goes back. Nothing is freed yet.
+- A bump pointer hands out fresh space and never goes back. Erased objects become free objects,
+  which the allocator reuses.
 - Objects of every kind (small, large, pinned) share the range. Frozen objects belong to the
   VM and live outside it; their segments are recorded in a list.
 
@@ -22,12 +23,17 @@ references are to dotnet/runtime tag v10.0.14. Current as of Stage 3.
 
 1. JIT helpers bump `alloc_ptr` up to `alloc_limit` in the thread's context without calling us.
 2. `IGCHeap::Alloc` (gcinterface.h:923) takes the slow path. Large- and pinned-heap requests, and
-   objects of 8 KB and up, come straight from the global bump pointer under a mutex.
-3. Otherwise the context is retired and gets a new 64 KB chunk.
+   objects of 8 KB and up, get a hole that fits, or fresh space.
+3. Otherwise the context is refilled from a hole of 4 KB or more; or the object goes into a smaller
+   hole on its own; or the context gets a fresh 64 KB chunk; or, when the heap is nearly full, the
+   object is placed on its own at the end.
 
 `alloc_limit` stops 24 bytes before the end of a chunk. A retired context's tail is covered with a
-free object, so the tail is always at least one minimum object. Memory is fresh from `mmap`, so it
-is already zero. Null means out of memory, and the VM throws.
+free object, so the tail is always at least one minimum object. Fresh memory is zero from `mmap`;
+holes are zeroed when taken. Null means out of memory, and the VM throws.
+
+Holes are kept in lists by power-of-two size, linked through the free object's `ObjHeader` slot, the
+only spare word a 24-byte block has. A split must leave nothing or at least 24 bytes.
 
 The mutex is taken in cooperative mode. Nothing inside it waits for the runtime.
 
@@ -55,23 +61,36 @@ The VM suspends threads for more than collections, and uses our `SetGCInProgress
 
 ## Finalization
 
-Registration is accepted and forgotten. No finalizer runs.
+Registration is accepted and forgotten. No finalizer runs. An erased object that has one is simply
+freed, so whatever it would have released leaks. That is safe, but a program that creates many
+`WeakReference`s or undisposed `SafeHandle`s leaks GC handles.
 
 ## Collection sequence
 
 `GC.Collect()` and other blocking requests, on the calling thread:
 
-1. Leave cooperative mode, take the collection lock, `SuspendEE`, go back to cooperative mode.
-2. Retire every allocation context, so the heap is objects and free objects end to end.
-3. Walk the heap and rebuild the start bitmap; clear the mark bitmap.
-4. Mark from stacks and thread statics (`GcScanRoots`), strong, pinned and ref-counted handles,
+1. Leave cooperative mode, take the collection lock, connect to the viewer. If there is none (and
+   no logging), stop here.
+2. `SuspendEE`, go back to cooperative mode.
+3. Retire every allocation context, so the heap is objects and free objects end to end.
+4. Walk the heap and rebuild the start bitmap; clear the mark bitmap.
+5. Mark from stacks and thread statics (`GcScanRoots`), strong, pinned and ref-counted handles,
    then dependent handles until nothing changes. Marking uses an explicit stack. Objects of
    collectible types also mark their LoaderAllocator.
-5. Log live and dead totals. Resume.
+6. Sever the dead: clear weak, ref-counted and dependent handles and sync block entries whose
+   object is unmarked. From here a dead object can never become reachable again, so it does not
+   matter that unerased dead objects may refer to erased ones: nothing ever follows them.
+7. Send the snapshot and serve Erase until Done or the connection closes. Erasing checks that the
+   address is an object start and unmarked, then makes it a free object.
+8. Sweep: merge neighbouring free objects and rebuild the free lists. Resume.
+
+Without a viewer, steps 6 to 8 do not happen: a census for the log changes nothing.
 
 An interior pointer is resolved by searching the start bitmap downwards. Any other reference that
 is not the start of an object ends the process: it means the heap is corrupt. Frozen objects count
 as live and are not scanned, as in the stock GC; they hold no references into this heap.
+
+`MANUALGC_POISON=1` fills erased objects with 0xDD, to expose use after free.
 
 ## Viewer protocol
 

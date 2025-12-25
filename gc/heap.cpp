@@ -1,6 +1,7 @@
 #include "heap.h"
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 
 uint8_t* Heap::s_base;
@@ -11,6 +12,8 @@ MethodTable* Heap::s_freeObjectMT;
 uint64_t* Heap::s_startBits;
 uint64_t* Heap::s_markBits;
 uint64_t Heap::s_totalAllocated;
+uint8_t* Heap::s_bins[BinCount];
+size_t Heap::s_freeListBytes;
 
 // Threads take this in cooperative mode. Nothing inside the lock waits for the runtime, so a
 // suspension request is delayed by at most one short critical section.
@@ -131,47 +134,109 @@ void Heap::RetireContext(gc_alloc_context* ctx, bool discountTail)
     ctx->alloc_limit = nullptr;
 }
 
+void Heap::PushFree(uint8_t* block, size_t size)
+{
+    uint8_t*& bin = s_bins[BinOf(size)];
+    NextFree(block) = bin;
+    bin = block;
+    __atomic_store_n(&s_freeListBytes, s_freeListBytes + size, __ATOMIC_RELAXED);
+}
+
+uint8_t* Heap::TakeFree(size_t minimum, size_t maximum, size_t* taken)
+{
+    uint8_t* result = nullptr;
+    pthread_mutex_lock(&s_heapLock);
+    for (int bin = BinOf(minimum); bin < BinCount && result == nullptr; bin++)
+    {
+        uint8_t** link = &s_bins[bin];
+        for (int probes = 0; *link != nullptr && probes < MaxProbes; probes++, link = &NextFree(*link))
+        {
+            uint8_t* block = *link;
+            size_t size = ObjectSize(block);
+            if (size < minimum)
+                continue;
+            // What is left over must be nothing, or big enough to be an object.
+            size_t use = size;
+            if (size >= maximum + min_obj_size)
+                use = maximum;
+            else if (size > maximum && minimum == maximum)
+                continue;
+            *link = NextFree(block);
+            __atomic_store_n(&s_freeListBytes, s_freeListBytes - size, __ATOMIC_RELAXED);
+            if (use < size)
+            {
+                MakeFreeObject(block + use, size - use);
+                PushFree(block + use, size - use);
+            }
+            result = block;
+            *taken = use;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_heapLock);
+    return result;
+}
+
+// A hole for exactly one object, zeroed.
+uint8_t* Heap::TakeHole(size_t size)
+{
+    size_t taken;
+    uint8_t* p = FreeListBytes() >= size ? TakeFree(size, size, &taken) : nullptr;
+    if (p != nullptr)
+        Zero(p, size);
+    return p;
+}
+
 Object* Heap::Alloc(gc_alloc_context* ctx, size_t size, uint32_t flags)
 {
     if (size > ReservedBytes())
         return nullptr;
     size = AlignUpTo(size < min_obj_size ? min_obj_size : size, sizeof(void*));
 
-    if (flags & GC_ALLOC_USER_OLD_HEAP)  // large or pinned object heap (gcinterface.h:1093-1095)
-    {
-        uint8_t* p = BumpGlobal(size);
-        if (p != nullptr)
-        {
-            ctx->alloc_bytes_uoh += (int64_t)size;
-            __atomic_add_fetch(&s_totalAllocated, size, __ATOMIC_RELAXED);
-        }
-        return (Object*)p;
-    }
-
-    if (size <= (size_t)(ctx->alloc_limit - ctx->alloc_ptr))
+    bool oldHeap = (flags & GC_ALLOC_USER_OLD_HEAP) != 0;  // large or pinned (gcinterface.h:1093-1095)
+    if (!oldHeap && size <= (size_t)(ctx->alloc_limit - ctx->alloc_ptr))
     {
         uint8_t* p = ctx->alloc_ptr;
         ctx->alloc_ptr += size;
         return (Object*)p;
     }
 
-    if (size >= DirectThreshold)
-    {
-        uint8_t* p = BumpGlobal(size);
+    auto single = [&](uint8_t* p) {
         if (p != nullptr)
         {
-            ctx->alloc_bytes += (int64_t)size;
+            (oldHeap ? ctx->alloc_bytes_uoh : ctx->alloc_bytes) += (int64_t)size;
             __atomic_add_fetch(&s_totalAllocated, size, __ATOMIC_RELAXED);
         }
         return (Object*)p;
+    };
+    if (oldHeap || size >= DirectThreshold)
+    {
+        uint8_t* p = TakeHole(size);
+        return single(p != nullptr ? p : BumpGlobal(size));
     }
 
-    uint8_t* chunk = BumpGlobal(ChunkSize);
-    if (chunk == nullptr)
-        return nullptr;
+    // Refill the context from a big hole, else place this object in a small one, else refill from
+    // fresh memory, else (the heap is nearly full) squeeze in just this object.
+    size_t chunkSize = ChunkSize;
+    uint8_t* chunk = nullptr;
+    size_t wanted = size + min_obj_size > MinHoleForContext ? size + min_obj_size : MinHoleForContext;
+    if (FreeListBytes() >= wanted)
+        chunk = TakeFree(wanted, ChunkSize, &chunkSize);
+    if (chunk != nullptr)
+        Zero(chunk, chunkSize);
+    else if (uint8_t* hole = TakeHole(size))
+        return single(hole);
+    else
+    {
+        chunkSize = ChunkSize;
+        chunk = BumpGlobal(ChunkSize);
+        if (chunk == nullptr)
+            return single(BumpGlobal(size));
+    }
+
     RetireContext(ctx, true);
     ctx->alloc_ptr = chunk + size;
-    ctx->alloc_limit = chunk + ChunkSize - min_obj_size;
+    ctx->alloc_limit = chunk + chunkSize - min_obj_size;
     // The VM reports per-thread totals as alloc_bytes - (alloc_limit - alloc_ptr).
     ctx->alloc_bytes += (int64_t)(ctx->alloc_limit - chunk);
     __atomic_add_fetch(&s_totalAllocated, (uint64_t)(ctx->alloc_limit - chunk), __ATOMIC_RELAXED);
@@ -209,4 +274,53 @@ uint8_t* Heap::FindObject(const void* p)
     }
     uint8_t* obj = s_base + (((word << 6) + (63 - (size_t)__builtin_clzll(candidates))) << 3);
     return (const uint8_t*)p < obj + ObjectSize(obj) ? obj : nullptr;  // else p is in free space
+}
+
+void Heap::Erase(uint8_t* obj)
+{
+    static const bool poison = getenv("MANUALGC_POISON") != nullptr;
+    size_t size = ObjectSize(obj);
+    if (poison)  // makes use after free show up; allocation zeroes the memory again
+        memset(obj, 0xDD, size - sizeof(ObjHeader));
+    s_startBits[BitIndex(obj) >> 6] &= ~(1ull << (BitIndex(obj) & 63));
+    s_markBits[BitIndex(obj) >> 6] &= ~(1ull << (BitIndex(obj) & 63));
+    NextFree(obj) = nullptr;  // clears the header
+    while (size > MaxFreeObject)
+    {
+        MakeFreeObject(obj, MaxFreeObject);
+        obj += MaxFreeObject;
+        size -= MaxFreeObject;
+    }
+    MakeFreeObject(obj, size);
+}
+
+void Heap::Sweep()
+{
+    // A preemptive thread cannot be allocating while the EE is suspended, so no lock is needed.
+    memset(s_bins, 0, sizeof(s_bins));
+    s_freeListBytes = 0;
+    uint8_t* run = nullptr;
+    size_t runSize = 0;
+    auto finishRun = [&] {
+        while (runSize > 0)
+        {
+            // A free object's size is limited by its 32-bit count.
+            size_t piece = runSize > MaxFreeObject ? MaxFreeObject : runSize;
+            MakeFreeObject(run, piece);
+            PushFree(run, piece);
+            run += piece;
+            runSize -= piece;
+        }
+    };
+    Walk([&](uint8_t* obj, size_t size, bool isFree) {
+        if (!isFree)
+        {
+            finishRun();
+            return;
+        }
+        if (runSize == 0)
+            run = obj;
+        runSize += size;
+    });
+    finishRun();
 }

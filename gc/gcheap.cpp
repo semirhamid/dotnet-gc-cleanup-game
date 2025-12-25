@@ -91,17 +91,18 @@ void ManualGCHeap::GetMemoryInfo(uint64_t* highMemLoadThresholdBytes, uint64_t* 
 {
     // genInfoRaw and pauseInfoRaw keep the zeros the caller put there.
     uint64_t physical = PhysicalMemory();
+    Collector::Totals totals = Collector::GetTotals();
     *highMemLoadThresholdBytes = physical / 10 * 9;
     *totalAvailableMemoryBytes = Heap::ReservedBytes() < physical ? Heap::ReservedBytes() : physical;
     *lastRecordedMemLoadBytes = 0;
-    *lastRecordedHeapSizeBytes = 0;
-    *lastRecordedFragmentationBytes = 0;
+    *lastRecordedHeapSizeBytes = totals.heapBytes + totals.freeBytes;
+    *lastRecordedFragmentationBytes = totals.freeBytes;
     *totalCommittedBytes = Heap::CommittedBytes();
     *promotedBytes = 0;
     *pinnedObjectCount = 0;
     *finalizationPendingCount = 0;
-    *index = 0;
-    *generation = 0;
+    *index = totals.collections;
+    *generation = totals.collections > 0 ? MaxGeneration : 0;
     *pauseTimePct = 0;
     *isCompaction = false;
     *isConcurrent = false;
@@ -131,13 +132,13 @@ unsigned ManualGCHeap::WhichGeneration(Object* obj)
     return Heap::Contains(obj) ? MaxGeneration : (unsigned)INT32_MAX;
 }
 
-int ManualGCHeap::CollectionCount(int, int) { return 0; }
+int ManualGCHeap::CollectionCount(int, int) { return (int)Collector::GetTotals().collections; }
 
 int ManualGCHeap::StartNoGCRegion(uint64_t totalSize, bool, uint64_t, bool)
 {
     if (s_noGCRegion)
         return start_no_gc_in_progress;
-    if (totalSize > Heap::ReservedBytes() - Heap::UsedBytes())
+    if (totalSize > Heap::ReservedBytes() - Heap::UsedBytes() + Heap::FreeListBytes())
         return start_no_gc_no_memory;
     s_noGCRegion = true;
     return start_no_gc_success;
@@ -151,7 +152,7 @@ int ManualGCHeap::EndNoGCRegion()
     return end_no_gc_success;
 }
 
-size_t ManualGCHeap::GetTotalBytesInUse() { return Heap::UsedBytes(); }
+size_t ManualGCHeap::GetTotalBytesInUse() { return Heap::UsedBytes() - Heap::FreeListBytes(); }
 uint64_t ManualGCHeap::GetTotalAllocatedBytes() { return Heap::TotalAllocated(); }
 
 HRESULT ManualGCHeap::GarbageCollect(int, bool, int mode)
@@ -165,7 +166,10 @@ HRESULT ManualGCHeap::GarbageCollect(int, bool, int mode)
 
 unsigned ManualGCHeap::GetMaxGeneration() { return MaxGeneration; }
 int ManualGCHeap::GetLastGCPercentTimeInGC() { return 0; }
-size_t ManualGCHeap::GetLastGCGenerationSize(int) { return 0; }
+size_t ManualGCHeap::GetLastGCGenerationSize(int gen)
+{
+    return gen == (int)MaxGeneration ? Collector::GetTotals().heapBytes : 0;
+}
 
 // ---- Used throughout the VM ----
 HRESULT ManualGCHeap::Initialize()
@@ -196,7 +200,7 @@ bool ManualGCHeap::IsGCInProgressHelper(bool)
     return __atomic_load_n(&s_gcInProgress, __ATOMIC_ACQUIRE);
 }
 
-unsigned ManualGCHeap::GetGcCount() { return 0; }
+unsigned ManualGCHeap::GetGcCount() { return Collector::GetTotals().collections; }
 bool ManualGCHeap::IsThreadUsingAllocationContextHeap(gc_alloc_context*, int) { return true; }
 bool ManualGCHeap::IsEphemeral(Object*) { return false; }
 
@@ -215,7 +219,7 @@ void ManualGCHeap::FixAllocContext(gc_alloc_context* acontext, void*, void*)
     Heap::RetireContext(acontext, false);
 }
 
-size_t ManualGCHeap::GetCurrentObjSize() { return Heap::UsedBytes(); }
+size_t ManualGCHeap::GetCurrentObjSize() { return Heap::UsedBytes() - Heap::FreeListBytes(); }
 
 void ManualGCHeap::SetGCInProgress(bool fInProgress)
 {
@@ -364,7 +368,7 @@ unsigned int ManualGCHeap::GetGenerationWithRange(Object* object, uint8_t** ppSt
     return WhichGeneration(object);
 }
 
-int64_t ManualGCHeap::GetTotalPauseDuration() { return 0; }
+int64_t ManualGCHeap::GetTotalPauseDuration() { return (int64_t)(Collector::GetTotals().pauseNanoseconds / 100); }
 void ManualGCHeap::EnumerateConfigurationValues(void*, ConfigurationValueFunc) {}
 int ManualGCHeap::RefreshMemoryLimit() { return 0; }
 
