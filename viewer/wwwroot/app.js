@@ -45,6 +45,11 @@ function applyColors() {
   colors = info.types.map(name => palette[slots.get(name) ?? 0]);
   colors[0] = css('--free');
 
+  fillLegend(ranked);
+}
+
+function fillLegend(ranked) {
+  if (isolated >= 0 && !ranked.some(t => t.index === isolated)) isolated = -1;  // all erased
   const legend = $('legend');
   legend.textContent = '';
   for (const t of ranked) {
@@ -89,12 +94,34 @@ function updateState(next) {
   lives.textContent = '';
   lives.setAttribute('aria-label', `${state.lives} of ${state.maxLives} lives`);
   lives.append('♥'.repeat(state.lives), Object.assign(document.createElement('span'), { className: 'lost', textContent: '♡'.repeat(state.maxLives - state.lives) }));
-  $('score').textContent = `${bytes(state.freedBytes)} freed from ${state.freedCount.toLocaleString()} object${state.freedCount === 1 ? '' : 's'}`;
+  $('score').textContent = `Score ${state.score.toLocaleString()}` + (state.peeked ? ' (peeked)' : '') +
+    ` · total ${state.totalScore.toLocaleString()} · ${bytes(state.freedBytes)} freed from ${state.freedCount.toLocaleString()} object${state.freedCount === 1 ? '' : 's'}` +
+    (state.destroyed ? ` · ${state.destroyed.toLocaleString()} live destroyed` : '');
+  deadline = info.frozen && state.remainingMs != null ? performance.now() + state.remainingMs : null;
+  showTimer();
+  $('hardcoreLabel').hidden = !(info.frozen && info.hardcoreAllowed);
+  $('hardcore').checked = state.hardcore;
+  $('danger').hidden = !(info.frozen && state.hardcore);
   $('done').disabled = !info.frozen;
   map.classList.toggle('playing', canErase());
 }
 
-const canErase = () => info?.frozen && state?.lives > 0;
+const canErase = () => info?.frozen && (state?.lives > 0 || state?.hardcore);
+
+let deadline = null;
+function showTimer() {
+  const seconds = deadline === null ? null : Math.max(0, Math.ceil((deadline - performance.now()) / 1000));
+  $('timer').textContent = seconds === null ? '' : `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  $('timer').classList.toggle('low', seconds !== null && seconds <= 10);
+}
+setInterval(showTimer, 250);
+
+function showSummary(message) {
+  const why = { done: 'Round over.', time: "Time's up.", gone: 'The app stopped waiting, or exited.' }[message.reason];
+  const missed = message.missedBytes > 0 ? `${bytes(message.missedBytes)} of garbage was left behind.` : 'Not a byte of garbage was left.';
+  $('summary').textContent = `${why} Score ${state.score.toLocaleString()}. ${missed}`;
+  $('summary').hidden = false;
+}
 
 let toastTimer;
 function toast(text) {
@@ -223,6 +250,13 @@ function showTooltip(event) {
 
 // ---- Eraser ----
 
+let legendQueued = false;
+function refreshLegend() {
+  if (legendQueued) return;
+  legendQueued = true;
+  setTimeout(() => { legendQueued = false; fillLegend(totals()); draw(); }, 200);
+}
+
 const asked = new Set();  // sent this round, so a drag does not repeat itself
 let erasing = false, pending = [], lastPoint = null;
 
@@ -232,7 +266,7 @@ function eraseAt(x, y) {
     for (let dx = -r; dx <= r; dx++) {
       if (dx * dx + dy * dy > r * r) continue;
       const i = blockUnder(x + dx * CELL, y + dy * CELL);
-      if (i < 0 || types[i] === 0 || asked.has(i) || knownLive.has(i)) continue;
+      if (i < 0 || types[i] === 0 || asked.has(i) || knownLive.has(i) && !state.hardcore) continue;
       if (isolated >= 0 && types[i] !== isolated) continue;  // dimmed blocks are out of reach
       asked.add(i);
       pending.push(i);
@@ -270,6 +304,7 @@ map.addEventListener('pointerdown', event => {
 });
 map.addEventListener('pointermove', event => { if (erasing && canErase()) eraseTo(event); });
 for (const name of ['pointerup', 'pointercancel']) map.addEventListener(name, () => { erasing = false; });
+$('hardcore').onchange = () => { asked.clear(); send({ type: 'hardcore', on: $('hardcore').checked }); };
 $('done').onclick = () => { $('done').disabled = true; send({ type: 'done' }); };
 
 map.addEventListener('pointermove', showTooltip);
@@ -289,24 +324,28 @@ let socket;
 function send(message) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message)); }
 
 const handlers = {
-  snapshot(message) { info = message; },
+  snapshot(message) { info = message; $('summary').hidden = true; },
   resumed(message) {
     if (!info) return;
     info.frozen = false;
     erasing = false;
     updateTitle();
     updateState(message.state);
+    showSummary(message);
   },
+  state(message) { updateState(message.state); draw(); },
   erased(message) {
     for (const i of message.freed) { types[i] = 0; asked.delete(i); if (live) live[i] = 0; }
+    for (const i of message.destroyed) { types[i] = 0; asked.delete(i); knownLive.delete(i); if (live) live[i] = 0; }
     for (const i of message.live) { knownLive.add(i); asked.delete(i); }
     const before = state.lives;
     updateState(message.state);
     if (message.live.length > 0) {
       const name = info.types[types[message.live[0]]];
-      toast(state.lives === 0 ? `${name} is in use. No lives left; press Done.` : `${name} is in use. ${before - state.lives === 1 ? 'One life lost.' : `${before - state.lives} lives lost.`}`);
+      toast(state.lives === 0 ? `${name} is in use. No lives left, so press Done.` : `${name} is in use. ${before - state.lives === 1 ? 'One life lost.' : `${before - state.lives} lives lost.`}`);
       pending = [];
     }
+    refreshLegend();
     draw();
   },
 };

@@ -17,6 +17,19 @@ namespace
     bool s_marking;  // start and mark bits are valid
     unsigned s_collections;
 
+    // Set once hardcore mode has freed something alive. References to nothing are then expected.
+    bool s_heapIsDamaged;
+
+    // Hardcore mode is for the person running the app to allow, not for whoever is on the socket.
+    bool HardcoreAllowed()
+    {
+        static const bool allowed = [] {
+            const char* value = getenv("MANUALGC_HARDCORE");
+            return value != nullptr && strcmp(value, "1") == 0;
+        }();
+        return allowed;
+    }
+
     // Objects marked but not yet scanned. Explicit, so deep object graphs cannot overflow the
     // thread's stack.
     struct MarkStack
@@ -46,7 +59,11 @@ namespace
         if (!Heap::Contains(obj))
             return;
         if (!Heap::IsObjectStart(obj))
+        {
+            if (s_heapIsDamaged)
+                return;
             Fatal("%s refers to %p, which is not an object", source, (void*)obj);
+        }
         if (!Heap::TestAndMark(obj))
             s_markStack.Push((uint8_t*)obj);
     }
@@ -234,12 +251,12 @@ namespace
     {
         s_types.Reset();
         s_link.Begin(1);
-        s_link.U32(1);
+        s_link.U32(2);
         s_link.U32((uint32_t)getpid());
         s_link.U32(s_collections);
         s_link.U64((uint64_t)Heap::FirstObject());
         s_link.U64((uint64_t)Heap::FirstObject() + Heap::UsedBytes());
-        s_link.U8(0);
+        s_link.U8(HardcoreAllowed() ? 1 : 0);
         s_link.End();
 
         // Types are sent before the objects that use them, so each batch needs two passes.
@@ -289,6 +306,7 @@ namespace
         size_t count;
         size_t bytes;
         size_t refused;
+        size_t destroyed;  // alive, hardcore mode
     } s_erased;
 
     enum EraseStatus : uint8_t
@@ -296,14 +314,16 @@ namespace
         Freed = 0,
         Alive = 1,
         NotAnObject = 2,
+        Destroyed = 3,
     };
 
-    EraseStatus EraseAt(uint64_t address)
+    EraseStatus EraseAt(uint64_t address, bool force)
     {
         uint8_t* obj = (uint8_t*)address;
         if (!Heap::Contains(obj) || !Heap::IsObjectStart(obj))
             return NotAnObject;
-        if (Heap::IsMarked(obj))
+        bool alive = Heap::IsMarked(obj);
+        if (alive && !force)
         {
             s_erased.refused++;
             return Alive;
@@ -311,6 +331,12 @@ namespace
         s_erased.count++;
         s_erased.bytes += ObjectSize(obj);
         Heap::Erase(obj);
+        if (alive)
+        {
+            s_erased.destroyed++;
+            s_heapIsDamaged = true;
+            return Destroyed;
+        }
         return Freed;
     }
 
@@ -324,21 +350,27 @@ namespace
         {
             if (type == 65)
                 return;
+            uint8_t flags = 0;
             uint32_t count = 0;
-            if (type == 64 && size >= sizeof(count))
-                memcpy(&count, payload, sizeof(count));
-            if (type != 64 || size != sizeof(count) + count * sizeof(uint64_t))
+            constexpr size_t header = sizeof(flags) + sizeof(count);
+            if (type == 64 && size >= header)
+            {
+                flags = payload[0];
+                memcpy(&count, payload + sizeof(flags), sizeof(count));
+            }
+            if (type != 64 || size != header + count * sizeof(uint64_t))
             {
                 LogLine("bad message %u from the viewer; resuming the app", type);
                 return;
             }
+            bool force = (flags & 1) != 0 && HardcoreAllowed();
             s_link.Begin(6);
             for (uint32_t i = 0; i < count; i++)
             {
                 uint64_t address;
-                memcpy(&address, payload + sizeof(count) + i * sizeof(address), sizeof(address));
+                memcpy(&address, payload + header + i * sizeof(address), sizeof(address));
                 s_link.U64(address);
-                s_link.U8(EraseAt(address));
+                s_link.U8(EraseAt(address, force));
             }
             s_link.End();
             s_link.Flush();
@@ -374,6 +406,11 @@ namespace
             SeverDead(sc);
             SendSnapshot();
             Play();
+            if (s_erased.destroyed > 0)
+            {
+                SeverDead(sc);  // weak references to what was destroyed
+                LogLine("gc %u destroyed %zu live objects; expect the app to crash", s_collections, s_erased.destroyed);
+            }
             Heap::Sweep();
             s_totals.collections++;
             s_totals.freeBytes = Heap::FreeListBytes();

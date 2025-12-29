@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Heap</title>
+  <title>Manual GC</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,12 +12,16 @@
     <p id="subtitle">Start an app with DOTNET_GCName=libmanualgc.dylib.</p>
     <div id="controls">
       <span id="lives" role="status"></span>
+      <span id="timer" role="timer"></span>
       <span id="score" role="status"></span>
       <button id="done" disabled>Done: resume the app</button>
       <label>Eraser <input type="range" id="radius" min="0" max="8" value="0"></label>
       <label>Bytes per block <select id="scale"></select></label>
-      <label><input type="checkbox" id="reveal"> Show what is alive</label>
+      <label><input type="checkbox" id="reveal"> Show what is alive (no score)</label>
+      <label id="hardcoreLabel" hidden><input type="checkbox" id="hardcore"> Hardcore: crashes the app</label>
     </div>
+    <p id="danger" role="alert" hidden>⚠ HARDCORE IS ON. Erasing a live object really frees it. The app will crash or corrupt its data.</p>
+    <p id="summary" role="status" hidden></p>
   </header>
   <main>
     <div id="map" tabindex="0" aria-label="Heap map">

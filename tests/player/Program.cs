@@ -4,6 +4,9 @@
 //   idle    in every collection, press Done at once
 //   greedy  in one collection, spend every life on live objects, then try to erase something dead
 //   random  in every collection, erase a random half of everything dead
+//   bytes   in every collection, erase every byte[] without peeking, and print the score
+//   wait    do nothing and let the time run out
+//   hardcore  in one collection, turn hardcore on and erase every live Kept object
 // Modes that play every collection stop when the viewer goes away.
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
@@ -33,7 +36,10 @@ try
                     refused += message.GetProperty("live").GetArrayLength();
                     if (await OnErased(message)) return 0;
                     break;
-                case "resumed" when mode is "look" or "greedy": return 0;
+                case "resumed":
+                    Console.WriteLine($"resumed: {message.GetProperty("reason").GetString()}, missed {message.GetProperty("missedBytes")}, {message.GetProperty("state")}");
+                    if (mode is "look" or "greedy" or "hardcore" or "wait") return 0;
+                    break;
             }
             continue;
         }
@@ -43,7 +49,17 @@ try
             words = MemoryMarshal.Cast<byte, uint>(data.AsSpan()).ToArray();
             rounds++;
             // A finished collection is sent to new pages too; there is nothing to play in it.
-            if (info.GetProperty("frozen").GetBoolean()) await Send(new { type = "reveal" });
+            if (!info.GetProperty("frozen").GetBoolean()) continue;
+            if (mode == "bytes")
+            {
+                live = new byte[words[1]];
+                expected = live.Length;
+                await Erase([.. Enumerable.Range(0, live.Length).Where(i => info.GetProperty("types")[(int)Type(i)].GetString() == "byte[]")]);
+            }
+            else if (mode != "wait")
+            {
+                await Send(new { type = "reveal" });
+            }
         }
         else if (tag == 2)
         {
@@ -70,6 +86,13 @@ async Task Play()
     {
         await Erase([.. Blocks(alive: true).Take(10), .. Blocks(alive: false).Take(10)]);
     }
+    else if (mode == "hardcore")
+    {
+        await Send(new { type = "hardcore", on = true });
+        int[] kept = [.. Blocks(alive: true).Where(i => info.GetProperty("types")[(int)Type(i)].GetString() == "Kept")];
+        expected = kept.Length;
+        await Erase(kept);
+    }
     else
     {
         int[] targets = mode == "idle" ? [] : Blocks(alive: false);
@@ -88,7 +111,16 @@ async Task Erase(int[] targets)
 async Task<bool> OnErased(JsonElement message)
 {
     int lives = message.GetProperty("state").GetProperty("lives").GetInt32();
-    if (mode == "greedy")
+    if (mode == "bytes")
+    {
+        await Send(new { type = "done" });
+    }
+    else if (mode == "hardcore")
+    {
+        Console.WriteLine($"destroyed {message.GetProperty("destroyed").GetArrayLength()}, refused {refused}");
+        await Send(new { type = "done" });
+    }
+    else if (mode == "greedy")
     {
         Console.WriteLine($"refused {refused}, freed {freed}, lives {lives}");
         // With no lives left, erasing is over, so this must have no effect.

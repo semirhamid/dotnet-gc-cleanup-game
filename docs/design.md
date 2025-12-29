@@ -1,7 +1,7 @@
 # Design
 
 Pinned to Microsoft.NETCore.App 10.0.14 on osx-arm64, GC interface 5.5, EE interface 4. Line
-references are to dotnet/runtime tag v10.0.14. Current as of Stage 4.
+references are to dotnet/runtime tag v10.0.14. Current as of Stage 5.
 
 ## Heap layout
 
@@ -105,3 +105,22 @@ the field offsets diagnostic tools use. The GC reads those offsets at run time a
 as a module path and TypeDef token, with generic arguments and array elements resolved to other
 types. The viewer looks the names up in the assemblies' metadata. If the descriptor is missing or
 incomplete, types appear by address. Types from in-memory assemblies have no file, so they do too.
+
+## Game
+
+The viewer keeps the score; the GC decides what may be freed.
+
+- A round is one collection. Score is the bytes freed, added up over a process's rounds. Looking at
+  what is alive (a switch on the page) sets the round's score to 0.
+- Three lives a round (`--Lives`). Each live object erased costs one and is shown as alive from
+  then on. With none left only Done works.
+- 120 seconds a round (`--Seconds`, 0 for no limit), then the app resumes.
+- Hardcore frees live objects for real. It takes both `MANUALGC_HARDCORE=1` on the app, which the
+  GC itself checks, and a switch on the page that is off at the start of every round. The page says
+  that it crashes the app. Afterwards the collector ignores references to things that are not
+  objects, instead of treating them as a corrupt heap.
+
+A heap with more than 2,000,000 blocks is shown, and can be erased, only up to that many.
+
+Anyone who can open a local TCP connection can play: there is no authentication. The viewer
+listens on loopback only and refuses pages from other origins and host names.

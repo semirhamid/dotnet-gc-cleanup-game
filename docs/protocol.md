@@ -1,4 +1,4 @@
-# GC to viewer protocol, version 1
+# GC to viewer protocol, version 2
 
 The GC connects to `127.0.0.1:5710` (`MANUALGC_PORT`; 0 turns the viewer off) each time it
 collects, and closes the connection when the app resumes. The app stays suspended from before Hello
@@ -17,7 +17,7 @@ Integers are little-endian. Strings are UTF-8.
 | 3 | Type | `u64` type id, `u8` kind, then by kind (below) |
 | 4 | Objects | repeated: `u64` address, `u64` size with flags in its low 3 bits (bit 0 live, bit 1 free space), `u64` type id (0 for free space) |
 | 5 | SnapshotEnd | `u64` number of entries sent |
-| 6 | EraseResults | repeated: `u64` address, `u8` status (0 freed, 1 refused because it is alive, 2 not an object). Answers one Erase, in order |
+| 6 | EraseResults | repeated: `u64` address, `u8` status (0 freed, 1 refused because it is alive, 2 not an object, 3 freed although alive). Answers one Erase, in order |
 
 Type kinds:
 
@@ -38,9 +38,10 @@ order and cover the whole heap.
 
 | Type | Name | Payload |
 |---|---|---|
-| 64 | Erase | `u32` count, that many `u64` object addresses |
+| 64 | Erase | `u8` flags (bit 0: free live objects too), `u32` count, that many `u64` object addresses |
 | 65 | Done | empty |
 
 Messages to the GC are at most 64 KB, so at most 8,000 addresses per Erase. The GC decides for
-itself what is alive; the flags in Objects are for display. A malformed message ends the collection
+itself what is alive; the flags in Objects are for display. It ignores bit 0 of Erase unless the
+app was started with `MANUALGC_HARDCORE=1`. A malformed message ends the collection
 and the app resumes.

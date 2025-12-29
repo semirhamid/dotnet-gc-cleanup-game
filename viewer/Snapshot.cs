@@ -17,7 +17,8 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
     public uint Gc => gc;
     public ulong Base => heapBase;
     public ulong End => end;
-    public byte Flags => flags;
+    /// <summary>The app was started with MANUALGC_HARDCORE=1.</summary>
+    public bool HardcoreAllowed => (flags & 1) != 0;
     public TypeNames Names { get; } = new();
     public int Count => _offsets.Count;
     public int Shown => Math.Min(Count, MaxShown);
@@ -43,6 +44,14 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
     {
         int i = address < heapBase ? -1 : _offsets.BinarySearch((uint)((address - heapBase) >> 3));
         return i < 0 ? -1 : i;
+    }
+
+    public long DeadBytes()
+    {
+        long bytes = 0;
+        for (int i = 0; i < Count; i++)
+            if (!IsFree(i) && !IsLive(i)) bytes += Size(i);
+        return bytes;
     }
 
     /// <summary>Records that the GC freed a block.</summary>

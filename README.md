@@ -1,21 +1,45 @@
 # manual-gc
 
-An experimental standalone GC for .NET 10.0.14 on macOS arm64, meant to be collected by hand.
-Stage 4 of 5: GC.Collect() pauses the app and shows its heap in a web page, where you erase garbage.
+An experimental garbage collector for .NET where the collecting is done by a person. When an app
+calls `GC.Collect()`, the app freezes and a web page shows its heap. You drag an eraser over what
+you think is garbage. Garbage is freed and its memory reused; touching something alive costs a life.
+Press Done and the app goes on.
 
-    make                 # builds artifacts/libmanualgc.dylib (Command Line Tools only)
-    tests/stage1.sh      # each stage has a script that builds, runs the samples and checks the result
+It is a standalone GC library for the stock .NET runtime: no fork, no patches. It is pinned to .NET
+10.0.14 on macOS arm64, and it is a toy: one heap, no concurrency, no compaction, no generations,
+and finalizers never run.
 
-To run another app, copy the dylib next to the app's dll and set `DOTNET_GCName=libmanualgc.dylib`.
-`DOTNET_GCName` must be a bare file name; with an absolute path the runtime itself crashes. Use
-`DOTNET_GCPath` for a path. `MANUALGC_LOG=1` prints statistics. Server GC is refused; some apps
-need `DOTNET_gcServer=0`.
+## Play
 
-To see a heap:
+Needs the .NET 10.0.14 runtime and the Xcode Command Line Tools.
 
-    dotnet run --project viewer                  # then open http://localhost:5711
-    DOTNET_GCName=libmanualgc.dylib dotnet samples/orchard/bin/Release/net10.0/orchard.dll
+    make
+    dotnet run --project viewer          # then open http://localhost:5711
 
-Do not set `DOTNET_GCName` for the viewer itself.
+In another terminal, an app that asks for five collections:
 
-[Protocol](docs/protocol.md) · [Design](docs/design.md) · [what is stubbed](docs/interface.md)
+    dotnet build -c Release samples/orchard
+    cp artifacts/libmanualgc.dylib samples/orchard/bin/Release/net10.0/
+    DOTNET_GCName=libmanualgc.dylib dotnet samples/orchard/bin/Release/net10.0/orchard.dll 5
+
+Any other app works the same way. `DOTNET_GCName` must be a bare file name, found next to the app's
+dll; with an absolute path the runtime itself crashes. Use `DOTNET_GCPath` for a path. Do not set
+either for the viewer. Without a viewer, `GC.Collect()` does nothing and the heap grows.
+
+| On the app | |
+|---|---|
+| `DOTNET_GCHeapHardLimit` | heap limit in bytes, hexadecimal (default 32 GB of address space) |
+| `DOTNET_gcServer=0` | needed for apps that ask for server GC, which is refused |
+| `MANUALGC_LOG` | 1 for summaries, 2 for counts per type |
+| `MANUALGC_PORT` | where the viewer listens for the GC (default 5710, 0 for no viewer) |
+| `MANUALGC_POISON=1` | overwrite erased memory, to expose use after free |
+| `MANUALGC_HARDCORE=1` | allow hardcore mode, where erasing live objects **crashes the app** |
+
+Viewer options: `--WebPort`, `--GcPort`, `--Lives`, `--Seconds`.
+
+## Tests
+
+`tests/stage1.sh` to `tests/stage5.sh` build everything, run the samples under this GC and check the
+results. The page checks need Node 22 and Chrome, and are skipped without them.
+
+[Design](docs/design.md) · [Protocol](docs/protocol.md) · [What is stubbed](docs/interface.md)

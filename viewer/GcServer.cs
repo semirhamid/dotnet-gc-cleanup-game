@@ -70,7 +70,7 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
             if (type == 1)
             {
                 uint version = reader.U32();
-                if (version != 1)
+                if (version != 2)
                     throw new InvalidDataException($"protocol version {version}");
                 snapshot = new Snapshot(reader.U32(), reader.U32(), reader.U64(), reader.U64(), reader.U8());
                 continue;
