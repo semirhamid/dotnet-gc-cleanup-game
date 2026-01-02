@@ -1,0 +1,72 @@
+#!/bin/bash
+# Runs any .NET app under the manual GC, with the viewer.
+#   ./play [--limit MB] <App.dll | project folder | App.csproj> [app arguments]
+# --limit   heap limit. At the limit the app freezes and you are asked to make room.
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+DOTNET=${DOTNET:-/opt/homebrew/bin/dotnet}
+WEB_PORT=${WEB_PORT:-5711}
+export MANUALGC_PORT=${MANUALGC_PORT:-5710}
+fail() { echo "play: $*" >&2; exit 1; }
+
+LIMIT=
+if [ "${1:-}" = --limit ]; then
+    case "${2:-}" in ''|*[!0-9]*) fail "--limit needs a number of megabytes";; esac
+    LIMIT=$2; shift 2
+fi
+[ $# -gt 0 ] || { sed -n '2,4s/^# *//p' "$0"; exit 2; }
+APP=$1; shift
+[ -e "$APP" ] || fail "no such file or folder: $APP"
+
+# A project is built as usual and run from its folder, where its settings and wwwroot are.
+if [ -d "$APP" ]; then
+    count=$(find "$APP" -maxdepth 1 -name '*.csproj' | wc -l | tr -d ' ')
+    [ "$count" = 1 ] || fail "$APP has $count project files; name the one to run"
+    APP=$(find "$APP" -maxdepth 1 -name '*.csproj')
+fi
+DIR=$(cd "$(dirname "$APP")" && pwd)
+case "$APP" in
+*.csproj)
+    PROJECT=$DIR/$(basename "$APP")
+    echo "play: building $PROJECT"
+    (cd "$DIR" && "$DOTNET" build -c Release -v q --nologo "$PROJECT") || fail "the build failed"
+    APP=$(cd "$DIR" && "$DOTNET" msbuild "$PROJECT" -getProperty:TargetPath -p:Configuration=Release)
+    ;;
+*.dll)
+    APP=$DIR/$(basename "$APP")
+    ;;
+*)
+    fail "give a .dll, a .csproj or a project folder. Native AOT and single-file apps cannot load another GC"
+    ;;
+esac
+CONFIG=${APP%.dll}.runtimeconfig.json
+[ -f "$CONFIG" ] || fail "$APP has no runtimeconfig.json next to it, so it is a library, or a .NET Framework app"
+grep -q '"includedFrameworks"' "$CONFIG" && fail "$APP is self-contained; publish it framework-dependent"
+
+# Only the .NET 10 runtime can load this GC, so older apps run on that.
+VERSION=$(grep -A1 '"Microsoft.NETCore.App"\|"Microsoft.AspNetCore.App"' "$CONFIG" | grep -o '"version": *"[0-9]*' | grep -o '[0-9]*$' | head -1)
+case "$VERSION" in
+10) ;;
+[1-9]) echo "play: built for .NET $VERSION, running on .NET 10 instead"; export DOTNET_ROLL_FORWARD=Major ;;
+*) fail "built for .NET ${VERSION:-unknown}, but this GC needs the .NET 10 runtime" ;;
+esac
+
+make -s -C "$HERE" || fail "could not build the GC"
+VIEWER=
+if ! curl -s -o /dev/null "http://localhost:$WEB_PORT/"; then
+    DLL=$HERE/viewer/bin/Release/net10.0/viewer.dll
+    "$DOTNET" build -c Release -v q --nologo "$HERE/viewer/viewer.csproj" > /dev/null || fail "could not build the viewer"
+    (cd "$HERE" && trap '' INT && exec "$DOTNET" "$DLL" --WebPort "$WEB_PORT" --GcPort "$MANUALGC_PORT") > "$HERE/artifacts/viewer.log" 2>&1 &
+    VIEWER=$!
+    trap 'kill $VIEWER 2> /dev/null' EXIT
+    for _ in $(seq 100); do curl -s -o /dev/null "http://localhost:$WEB_PORT/" && break; sleep 0.1; done
+fi
+echo "play: fly at http://localhost:$WEB_PORT/flight.html or use the map at http://localhost:$WEB_PORT"
+
+export DOTNET_GCPath=$HERE/artifacts/libmanualgc.dylib DOTNET_gcServer=0
+unset DOTNET_GCName
+[ -n "$LIMIT" ] && export DOTNET_GCHeapHardLimit=$(printf '0x%x' $((LIMIT * 1024 * 1024)))
+cd "$DIR"
+set +e
+"$DOTNET" "$APP" "$@"
+exit $?

@@ -134,7 +134,7 @@ function toast(text) {
 function updateTitle() {
   if (!info) return;
   $('title').textContent = `Process ${info.pid}, collection ${info.gc}: ${bytes(info.bytes)} heap`;
-  let text = `${info.count.toLocaleString()} objects and free blocks. ` + (info.frozen ? 'The app is paused.' : 'The app has resumed; this is how the heap looked.');
+  let text = `${info.count.toLocaleString()} objects and free blocks. ` + (info.frozen ? (info.outOfMemory ? 'The app is out of memory! Make room.' : 'The app is paused.') : 'The app has resumed; this is how the heap looked.');
   if (info.shown < info.count) text += ` Only the first ${info.shown.toLocaleString()} are shown.`;
   $('subtitle').textContent = text;
 }
@@ -323,11 +323,24 @@ $('reveal').onchange = () => {
 let socket;
 function send(message) { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message)); }
 
+// Apps that are running and can be frozen from here.
+let apps = [];
+function showApps() {
+  $('apps').replaceChildren(...apps.map(a => {
+    const button = Object.assign(document.createElement('button'), { textContent: `Freeze ${a.name} (${a.pid})`, disabled: Boolean(info?.frozen) });
+    button.onclick = () => send({ type: 'collect', app: a.id });
+    return button;
+  }));
+  if (!info && apps.length > 0) { $('title').textContent = 'Ready'; $('subtitle').textContent = 'Freeze an app to see its heap.'; }
+}
+
 const handlers = {
-  snapshot(message) { info = message; $('summary').hidden = true; },
+  apps(message) { apps = message.apps; showApps(); },
+  snapshot(message) { info = message; $('summary').hidden = true; showApps(); },
   resumed(message) {
     if (!info) return;
     info.frozen = false;
+    showApps();
     erasing = false;
     updateTitle();
     updateState(message.state);

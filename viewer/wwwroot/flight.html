@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loose Balloons</title>
+  <link rel="stylesheet" href="flight.css">
+</head>
+<body>
+  <canvas id="sky" aria-label="Night sky with balloons. Fly with the arrow keys or the mouse."></canvas>
+
+  <div id="hud">
+    <div id="left">
+      <span id="lives" role="status"></span>
+      <span id="hull" role="status"></span>
+      <span id="timer" role="timer"></span>
+    </div>
+    <div id="middle">
+      <span id="points">0</span>
+      <span id="combo"></span>
+      <small id="freed" role="status"></small>
+    </div>
+    <div id="right">
+      <span id="flares" title="Flares: F"></span>
+      <span id="chainBox" title="Chain shot: X"><i id="chain"></i><em>chain X</em></span>
+      <button id="land">Land: resume the app</button>
+      <a href="./">Heap map</a>
+      <button id="sound" aria-pressed="true" title="Sound: M">♪</button>
+    </div>
+  </div>
+  <p id="toast" role="alert" hidden></p>
+  <p id="label" hidden></p>
+
+  <section id="panel">
+    <h1 id="panelTitle">Loose Balloons</h1>
+    <p id="panelText"></p>
+    <div id="apps"></div>
+    <div id="rules">
+      <p><b>Every balloon is an object in a running .NET app, and every rope is a reference.</b> Lights run along a rope from the balloon that holds to the balloon that is held.</p>
+      <p>The tower is the root. If ropes lead from the tower to a balloon, however long the way, the app can still reach it: it is <b>alive</b>. Anything else is garbage, even if it is tied to other garbage, and even if it <i>holds</i> something alive. <b>Shoot what is loose.</b> The memory is really freed.</p>
+      <dl>
+        <dt>← → or mouse</dt><dd>steer</dd>
+        <dt>↑</dt><dd>full throttle</dd>
+        <dt>Space or click</dt><dd>shoot</dd>
+        <dt>F</dt><dd>flare: light spreads from the tower along the ropes, which is the GC's mark phase. Two a round.</dd>
+        <dt>X</dt><dd>chain shot: pops a balloon and what it holds, rope by rope, until it meets something alive. That costs a life, so trace first. Popping charges it.</dd>
+        <dt>Enter</dt><dd>land: the round ends and the app resumes</dd>
+      </dl>
+      <p>Crows roost on garbage. They are out to wreck your plane, but where they come from tells you something. Circle the tower to repair.</p>
+    </div>
+    <button id="go">Practice flight</button>
+  </section>
+  <script src="flight.js"></script>
+</body>
+</html>

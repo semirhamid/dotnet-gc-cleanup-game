@@ -1,7 +1,9 @@
 #include "gcheap.h"
+#include "attach.h"
 #include "collector.h"
 #include "handles.h"
 #include "heap.h"
+#include "link.h"
 
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -160,7 +162,7 @@ HRESULT ManualGCHeap::GarbageCollect(int, bool, int mode)
     // Memory pressure requests from the VM are non-blocking (vm/comutilnative.cpp:1472). Only
     // GC.Collect() and other explicit blocking requests are a person's decision.
     if ((mode & collection_non_blocking) == 0)
-        Collector::Collect();
+        Collector::Collect(false);
     return S_OK;
 }
 
@@ -187,6 +189,7 @@ HRESULT ManualGCHeap::Initialize()
     LogLine("initialized, reserved %zu MB", Heap::ReservedBytes() >> 20);
     if (LogLevel() > 0)
         atexit(LogStatistics);
+    Attach::Start();
     return S_OK;
 }
 
@@ -243,7 +246,11 @@ size_t ManualGCHeap::GetNow() { return (size_t)(clock_gettime_nsec_np(CLOCK_UPTI
 // ---- Allocation ----
 Object* ManualGCHeap::Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags)
 {
-    return Heap::Alloc(acontext, size, flags);
+    Object* obj = Heap::Alloc(acontext, size, flags);
+    // Other threads may take what a collection freed before this one gets to it.
+    for (int tries = 0; obj == nullptr && tries < 4 && ViewerLink::Enabled() && size <= Heap::ReservedBytes() && Collector::CollectForAllocation(); tries++)
+        obj = Heap::Alloc(acontext, size, flags);
+    return obj;
 }
 
 void ManualGCHeap::PublishObject(uint8_t*) {}

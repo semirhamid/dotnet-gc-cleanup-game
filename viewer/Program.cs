@@ -31,7 +31,7 @@ app.UseStaticFiles(new StaticFileOptions
     OnPrepareResponse = c => c.Context.Response.Headers.CacheControl = "no-cache",
 });
 app.UseWebSockets();
-app.Map("/ws", async (HttpContext context, Session session, Browsers browsers) =>
+app.Map("/ws", async (HttpContext context, Session session, Browsers browsers, IHostApplicationLifetime lifetime) =>
 {
     if (!context.WebSockets.IsWebSocketRequest)
     {
@@ -46,7 +46,9 @@ app.Map("/ws", async (HttpContext context, Session session, Browsers browsers) =
         return;
     }
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    await browsers.RunAsync(socket, session, context.RequestAborted);
+    // Open pages must not hold up shutting down.
+    using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, lifetime.ApplicationStopping);
+    await browsers.RunAsync(socket, session, stop.Token);
 });
 
 Console.WriteLine($"Viewer: http://localhost:{webPort}   waiting for the GC on 127.0.0.1:{gcPort}");

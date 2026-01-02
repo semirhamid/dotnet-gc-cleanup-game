@@ -1,10 +1,12 @@
 // Threads keep changing object graphs while another thread collects. Every structure carries what
 // is needed to check it, so freeing something alive or handing out memory twice shows up.
-// Arguments: seconds (default 10). Exits 1 if a check fails.
+// Arguments: seconds (default 10), and microseconds each thread rests between operations, to make
+// less garbage (default 0). Exits 1 if a check fails.
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 double seconds = args.Length > 0 ? double.Parse(args[0]) : 10;
+int rest = args.Length > 1 ? int.Parse(args[1]) : 0;
 bool stop = false;
 long operations = 0;
 var failures = new ConcurrentQueue<string>();
@@ -70,6 +72,7 @@ var workers = Enumerable.Range(0, 6).Select(t => new Thread(() =>
             Array.Fill(big, n);
         }
         n++;
+        if (rest > 0 && n % 100 == 0) Thread.Sleep(TimeSpan.FromMicroseconds(rest * 100));
     }
     Interlocked.Add(ref operations, n);
 })).ToList();

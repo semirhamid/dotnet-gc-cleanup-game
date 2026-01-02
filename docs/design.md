@@ -65,9 +65,20 @@ Registration is accepted and forgotten. No finalizer runs. An erased object that
 freed, so whatever it would have released leaks. That is safe, but a program that creates many
 `WeakReference`s or undisposed `SafeHandle`s leaks GC handles.
 
+## What starts a collection
+
+- The app: `GC.Collect()` and other blocking requests.
+- The viewer: a native thread keeps a control connection open and collects when told to, so apps that
+  never ask can be played. It is created not suspendable, like the stock server GC's threads.
+- A full heap: an allocation that fails lets a person make room and tries again, a few times. If a
+  round made next to none, allocations fail with OutOfMemoryException for 5 seconds before it asks again.
+
+Memory pressure requests from the VM are ignored. The app is suspended for the whole round, so its
+requests and timers wait.
+
 ## Collection sequence
 
-`GC.Collect()` and other blocking requests, on the calling thread:
+On the thread that started it:
 
 1. Leave cooperative mode, take the collection lock, connect to the viewer. If there is none (and
    no logging), stop here.
@@ -120,7 +131,25 @@ The viewer keeps the score; the GC decides what may be freed.
   that it crashes the app. Afterwards the collector ignores references to things that are not
   objects, instead of treating them as a corrupt heap.
 
-A heap with more than 2,000,000 blocks is shown, and can be erased, only up to that many.
+A heap with more than 2,000,000 blocks is shown, and can be erased, only up to that many, and cannot
+be flown.
 
 Anyone who can open a local TCP connection can play: there is no authentication. The viewer
 listens on loopback only and refuses pages from other origins and host names.
+
+## Loose Balloons
+
+The GC sends the references and roots it marked from. The viewer marks again from those alone and
+counts objects where it and the GC disagree; tests/flight.sh requires zero.
+
+A heap has too many objects to fly through, so the viewer shrinks the graph to at most about 150 nodes
+(ObjectGraph.cs): things held by only one other go into their holder, like objects with one holder are
+joined, the least interesting live branches fold into what holds them, and small garbage is put
+together by type. Objects that are alive and dead are never put together, and every edge marking needs
+is kept, so a node is garbage exactly when no path of edges leads to it from a root node. The page is
+not told which nodes those are. It can work that out, and does so for the flare, for explaining a
+refused shot, and for choosing where crows come from.
+
+Shooting a node erases everything in it, if it is dead. A live node costs one life however many objects
+it stands for, so only one of them is put to the GC. Three hits by crows also cost a life. Points are for
+fun; the score is still the bytes freed. Hardcore mode is not offered here.

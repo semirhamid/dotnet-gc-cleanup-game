@@ -6,7 +6,11 @@
 namespace Collector
 {
     // Runs one collection on the calling thread.
-    void Collect();
+    void Collect(bool outOfMemory);
+
+    // For an allocation that failed: gives a person the chance to make room. Returns true if it is
+    // worth trying again.
+    bool CollectForAllocation();
 
     // True for objects outside the heap, and for every object outside a collection.
     bool IsPromoted(Object* obj);

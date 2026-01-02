@@ -49,3 +49,9 @@ aside { width: 320px; padding: 12px; overflow-y: auto; border-left: 1px solid va
 #danger { margin: 8px 0 0; padding: 8px 12px; border-radius: 6px; background: var(--critical); color: #fff; font-weight: 700; }
 #summary { margin: 8px 0 0; padding: 8px 12px; border-radius: 6px; background: var(--dim); color: var(--text); }
 [hidden] { display: none !important; }
+#fly { float: right; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; color: inherit; text-decoration: none; font-weight: 600; }
+#fly:hover { background: var(--dim); }
+#apps { display: flex; gap: 8px; flex-wrap: wrap; }
+#apps:not(:empty) { margin-bottom: 8px; }
+#apps button { padding: 6px 14px; border: 1px solid var(--accent); border-radius: 6px; background: none; color: inherit; font: inherit; font-weight: 600; cursor: pointer; }
+#apps button:disabled { opacity: .4; cursor: default; }

@@ -68,6 +68,42 @@ namespace
             s_markStack.Push((uint8_t*)obj);
     }
 
+    // Roots found by the current collection, kept for the snapshot.
+    enum RootKind : uint8_t
+    {
+        StackRoot = 0,  // stacks and thread statics; the EE reports both the same way
+        HandleRoot = 1,
+        PinnedRoot = 2,
+        RefCountedRoot = 3,
+    };
+    struct Root
+    {
+        Object* obj;
+        RootKind kind;
+    };
+    struct RootList
+    {
+        Root* items;
+        size_t count;
+        size_t capacity;
+
+        void Add(Object* obj, RootKind kind)
+        {
+            if (count == capacity)
+            {
+                capacity = capacity == 0 ? 4096 : capacity * 2;
+                items = (Root*)realloc(items, capacity * sizeof(Root));
+                if (items == nullptr)
+                    Fatal("out of memory growing the root list to %zu entries", capacity);
+            }
+            items[count++] = {obj, kind};
+        }
+    };
+    RootList s_roots;
+    RootKind s_rootKind;
+    bool s_recordRoots;
+    bool s_outOfMemory;  // why the current collection was started
+
     void Drain()
     {
         while (s_markStack.count > 0)
@@ -92,6 +128,8 @@ namespace
             if (obj == nullptr)
                 return;
         }
+        if (s_recordRoots)
+            s_roots.Add(obj, s_rootKind);
         Mark(obj, "a root");
         Drain();
     }
@@ -99,6 +137,7 @@ namespace
     void MarkHandles(ScanContext* sc)
     {
         Handles::ForEach([=](HandleSlot* slot, uint32_t type) {
+            s_rootKind = type == HNDTYPE_PINNED ? PinnedRoot : type == HNDTYPE_REFCOUNTED ? RefCountedRoot : HandleRoot;
             switch (type)
             {
             case HNDTYPE_STRONG:
@@ -149,6 +188,7 @@ namespace
 
     void MarkFromRoots(ScanContext& sc)
     {
+        s_rootKind = StackRoot;
         g_ee->GcScanRoots(Promote, MaxGeneration, MaxGeneration, &sc);
         MarkHandles(&sc);
         MarkDependentHandles();
@@ -247,16 +287,81 @@ namespace
     ViewerLink s_link;
     TypeDescriber s_types;
 
+    // Writes Reference messages of bounded size.
+    struct ReferenceWriter
+    {
+        size_t inMessage = 0;
+
+        void Add(uint8_t* from, uint8_t* to)
+        {
+            if (inMessage == 4096)
+                Finish();
+            if (inMessage++ == 0)
+                s_link.Begin(7);
+            s_link.U64((uint64_t)from);
+            s_link.U64((uint64_t)to);
+        }
+
+        void Finish()
+        {
+            if (inMessage > 0)
+                s_link.End();
+            inMessage = 0;
+        }
+    };
+
+    // Every edge that marking follows, and the roots it started from.
+    void SendGraph()
+    {
+        ReferenceWriter writer;
+        Heap::Walk([&](uint8_t* obj, size_t size, bool isFree) {
+            if (isFree)
+                return;
+            ForEachReference(obj, size, [&](Object** slot) {
+                // A dead object may still point at something erased earlier.
+                uint8_t* target = (uint8_t*)*slot;
+                if (target != obj && Heap::Contains(target) && Heap::IsObjectStart(target))
+                    writer.Add(obj, target);
+            });
+            if (Heap::IsMarked(obj) && MethodTableOf(obj)->Collectible())
+            {
+                uint8_t* allocator = g_ee->GetLoaderAllocatorObjectForGC((Object*)obj);
+                if (allocator != obj && Heap::Contains(allocator))
+                    writer.Add(obj, allocator);
+            }
+        });
+        Handles::ForEach([&](HandleSlot* slot, uint32_t type) {
+            if (type != HNDTYPE_DEPENDENT || !Heap::Contains(slot->secondary) || !Collector::IsPromoted(slot->object))
+                return;
+            if (Heap::Contains(slot->object))
+                writer.Add((uint8_t*)slot->object, (uint8_t*)slot->secondary);
+            else
+                s_roots.Add(slot->secondary, HandleRoot);  // a frozen primary never dies
+        });
+        writer.Finish();
+
+        for (size_t i = 0; i < s_roots.count;)
+        {
+            s_link.Begin(8);
+            for (size_t end = min(i + 4096, s_roots.count); i < end; i++)
+            {
+                s_link.U64((uint64_t)s_roots.items[i].obj);
+                s_link.U8(s_roots.items[i].kind);
+            }
+            s_link.End();
+        }
+    }
+
     void SendSnapshot()
     {
         s_types.Reset();
         s_link.Begin(1);
-        s_link.U32(2);
+        s_link.U32(3);
         s_link.U32((uint32_t)getpid());
         s_link.U32(s_collections);
         s_link.U64((uint64_t)Heap::FirstObject());
         s_link.U64((uint64_t)Heap::FirstObject() + Heap::UsedBytes());
-        s_link.U8(HardcoreAllowed() ? 1 : 0);
+        s_link.U8((uint8_t)((HardcoreAllowed() ? 1 : 0) | (s_outOfMemory ? 2 : 0)));
         s_link.End();
 
         // Types are sent before the objects that use them, so each batch needs two passes.
@@ -293,6 +398,7 @@ namespace
         });
         if (count > 0)
             sendBatch();
+        SendGraph();
         s_link.Begin(5);
         s_link.U64(total);
         s_link.End();
@@ -392,6 +498,8 @@ namespace
             g_ee->BeforeGcScanRoots(MaxGeneration, false, false);
         }
         s_marking = true;
+        s_roots.count = 0;
+        s_recordRoots = playing;
         MarkFromRoots(sc);
         uint64_t marked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (LogLevel() > 0)
@@ -406,6 +514,8 @@ namespace
             SeverDead(sc);
             SendSnapshot();
             Play();
+            if (!s_link.Connected())
+                LogLine("gc %u resuming the app without a Done", s_collections);
             if (s_erased.destroyed > 0)
             {
                 SeverDead(sc);  // weak references to what was destroyed
@@ -437,7 +547,7 @@ Object* Collector::FindObject(void* p)
     return s_marking && Heap::Contains(p) ? (Object*)Heap::FindObject(p) : nullptr;
 }
 
-void Collector::Collect()
+void Collector::Collect(bool outOfMemory)
 {
     // The order the stock workstation GC uses. GC.Collect arrives in cooperative mode
     // (vm/comutilnative.cpp:849); waiting for another collection in that mode would deadlock,
@@ -456,9 +566,37 @@ void Collector::Collect()
     if (wasCooperative)
         g_ee->DisablePreemptiveGC();
 
+    s_outOfMemory = outOfMemory;
     CollectSuspended();
 
     s_link.Close();
     g_ee->RestartEE(true);
     pthread_mutex_unlock(&s_collectLock);
+}
+
+bool Collector::CollectForAllocation()
+{
+    // Several threads usually run out together. The first one's collection is enough for all.
+    static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t s_uselessUntil;  // after a round that made no room, let the app see the failure
+    unsigned before = s_totals.collections;
+
+    bool wasCooperative = g_ee->EnablePreemptiveGC();  // others may wait here for a long time
+    pthread_mutex_lock(&s_lock);
+    bool retry = s_totals.collections != before;
+    if (!retry && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= s_uselessUntil)
+    {
+        if (wasCooperative)
+            g_ee->DisablePreemptiveGC();
+        Collect(true);
+        if (wasCooperative)
+            g_ee->EnablePreemptiveGC();
+        retry = s_totals.collections != before;
+        if (!retry || s_erased.bytes < Heap::ReservedBytes() / 64)
+            s_uselessUntil = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 5000000000ull;
+    }
+    pthread_mutex_unlock(&s_lock);
+    if (wasCooperative)
+        g_ee->DisablePreemptiveGC();
+    return retry;
 }

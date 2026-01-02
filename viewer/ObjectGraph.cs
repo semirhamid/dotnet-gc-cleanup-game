@@ -1,0 +1,300 @@
+namespace ManualGC.Viewer;
+
+/// <summary>
+/// The heap as a small directed graph for the flight game. A node stands for one object or for many,
+/// but never for live and dead ones together, so a node is garbage exactly when no path of edges
+/// leads to it from a root node.
+/// </summary>
+sealed class ObjectGraph
+{
+    public const int MaxLive = 90, MaxDead = 60, MaxEdges = 700;
+    const int MaxSiblings = 5;   // nodes that many like objects with the same holder are split into
+
+    public sealed record Node(string Type, int Count, long Bytes, int RootKind);
+
+    public List<Node> Nodes { get; } = [];
+    public List<int[]> Members { get; } = [];  // block indexes, by node
+    public List<(int From, int To)> Edges { get; } = [];
+    public int[] NodeOf { get; }               // by block, or -1
+
+    /// <summary>Objects whose liveness, worked out here from roots and references, differs from the GC's.</summary>
+    public int Disagreements { get; }
+
+    readonly Snapshot _snapshot;
+    readonly int[] _merged;  // union-find
+
+    public ObjectGraph(Snapshot snapshot)
+    {
+        _snapshot = snapshot;
+        int n = snapshot.Count;
+        _merged = new int[n];
+        for (int i = 0; i < n; i++) _merged[i] = i;
+        NodeOf = new int[n];
+
+        var (start, targets) = OutEdges();
+        var rootKind = new int[n];
+        Array.Fill(rootKind, -1);
+        var queue = new List<int>();
+        var parent = new int[n];
+        var reached = new bool[n];
+        foreach (var (block, kind) in snapshot.Roots())
+        {
+            if (reached[block] || snapshot.IsFree(block)) continue;
+            rootKind[block] = kind;
+            reached[block] = true;
+            parent[block] = -1;
+            queue.Add(block);
+        }
+
+        // Mark again, breadth first, to learn the shortest way to everything.
+        for (int at = 0; at < queue.Count; at++)
+        {
+            int from = queue[at];
+            for (int e = start[from]; e < start[from + 1]; e++)
+            {
+                int to = targets[e];
+                if (reached[to]) continue;
+                reached[to] = true;
+                parent[to] = from;
+                queue.Add(to);
+            }
+        }
+        int objects = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (snapshot.IsFree(i)) continue;
+            objects++;
+            if (reached[i] != snapshot.IsLive(i)) Disagreements++;
+        }
+
+        // Something holding each dead object, if anything does, preferring the first.
+        for (int i = 0; i < n; i++)
+            if (!reached[i]) parent[i] = -1;
+        for (int from = 0; from < n; from++)
+        {
+            if (reached[from]) continue;
+            for (int e = start[from]; e < start[from + 1]; e++)
+                if (!reached[targets[e]] && parent[targets[e]] < 0) parent[targets[e]] = from;
+        }
+
+        if (objects > MaxLive + MaxDead)
+        {
+            FoldLeaves(start, targets, reached, rootKind);
+            JoinSiblings(reached, parent, rootKind);
+        }
+        LimitLive(queue, parent);
+        LimitDead(reached);
+        Number(reached, rootKind, start, targets, parent);
+    }
+
+    (int[] Start, int[] Targets) OutEdges()
+    {
+        int n = _snapshot.Count;
+        var start = new int[n + 1];
+        foreach (var (from, _) in _snapshot.References()) start[from + 1]++;
+        for (int i = 0; i < n; i++) start[i + 1] += start[i];
+        var next = start[..^1];
+        var targets = new int[start[n]];
+        foreach (var (from, to) in _snapshot.References()) targets[next[from]++] = to;
+        return (start, targets);
+    }
+
+    int Group(int i)
+    {
+        while (_merged[i] != i) i = _merged[i] = _merged[_merged[i]];
+        return i;
+    }
+
+    void Merge(int child, int into) => _merged[Group(child)] = Group(into);
+
+    /// <summary>Puts things that hold nothing and have one holder into that holder: the array inside a list, say.</summary>
+    void FoldLeaves(int[] start, int[] targets, bool[] reached, int[] rootKind)
+    {
+        int n = _snapshot.Count;
+        var holder = new int[n];
+        var holds = new bool[n];
+        for (int pass = 0; pass < 4; pass++)
+        {
+            Array.Fill(holder, -1);
+            Array.Clear(holds);
+            for (int i = 0; i < n; i++)
+            {
+                for (int e = start[i]; e < start[i + 1]; e++)
+                {
+                    int from = Group(i), to = Group(targets[e]);
+                    if (from == to) continue;
+                    holds[from] = true;
+                    holder[to] = holder[to] == -1 || holder[to] == from ? from : -2;
+                }
+            }
+            bool changed = false;
+            for (int i = 0; i < n; i++)
+            {
+                if (_merged[i] != i || holds[i] || holder[i] < 0 || rootKind[i] >= 0 || reached[i] != reached[holder[i]]) continue;
+                // Keep the app's own objects on the map while there is room for them.
+                if (pass == 0 && IsAppType(i)) continue;
+                Merge(i, holder[i]);
+                changed = true;
+            }
+            if (!changed) return;
+        }
+    }
+
+    /// <summary>Joins objects of one type that are held by the same thing.</summary>
+    void JoinSiblings(bool[] reached, int[] parent, int[] rootKind)
+    {
+        var families = new Dictionary<(bool, int, int, int), List<int>>();
+        for (int i = 0; i < _snapshot.Count; i++)
+        {
+            if (_merged[i] != i || _snapshot.IsFree(i)) continue;
+            int holder = parent[i] < 0 ? -1 : Group(parent[i]);
+            var key = (reached[i], _snapshot.TypeOf(i), holder, rootKind[i]);
+            if (!families.TryGetValue(key, out var family)) families[key] = family = [];
+            family.Add(i);
+        }
+        foreach (var family in families.Values)
+        {
+            if (family.Count <= MaxSiblings) continue;
+            for (int i = MaxSiblings; i < family.Count; i++) Merge(family[i], family[i % MaxSiblings]);
+        }
+    }
+
+    /// <summary>Keeps the most interesting part of the live graph and folds the rest into what holds it.</summary>
+    void LimitLive(List<int> order, int[] parent)
+    {
+        // Worth following: subtrees with the app's own types in them, then large ones.
+        var weight = new Dictionary<int, long>();
+        var children = new Dictionary<int, List<int>>();
+        var holder = new Dictionary<int, int>();
+        foreach (int i in order)
+        {
+            int group = Group(i);
+            if (parent[i] < 0) holder[group] = -1;
+            else holder.TryAdd(group, Group(parent[i]));
+        }
+        foreach (var (group, held) in holder)
+        {
+            if (held < 0) continue;
+            if (!children.TryGetValue(held, out var list)) children[held] = list = [];
+            list.Add(group);
+        }
+        var own = new Dictionary<int, long>();
+        foreach (int i in order)
+            own[Group(i)] = own.GetValueOrDefault(Group(i)) + _snapshot.Size(i) + (IsAppType(i) ? 1L << 40 : 0);
+        // Holders come before what they hold, so going backwards sees every subtree complete.
+        foreach (int group in order.Select(Group).Distinct().Reverse())
+        {
+            weight[group] = weight.GetValueOrDefault(group) + own[group];
+            if (holder[group] is >= 0 and var held) weight[held] = weight.GetValueOrDefault(held) + weight[group];
+        }
+
+        var kept = new HashSet<int>();
+        var candidates = new PriorityQueue<int, long>();
+        foreach (var (group, held) in holder)
+            if (held < 0) candidates.Enqueue(group, -weight.GetValueOrDefault(group));
+        while (kept.Count < MaxLive && candidates.TryDequeue(out int group, out _))
+        {
+            if (!kept.Add(group)) continue;
+            foreach (int child in children.GetValueOrDefault(group) ?? [])
+                candidates.Enqueue(child, -weight.GetValueOrDefault(child));
+        }
+
+        // Roots that did not make it share one node, since nothing on the map holds them.
+        int spare = -1;
+        foreach (int i in order)
+        {
+            int group = Group(i);
+            if (kept.Contains(group)) continue;
+            if (parent[i] >= 0 && Group(parent[i]) != group) Merge(i, parent[i]);
+            else if (parent[i] < 0)
+            {
+                if (spare < 0) kept.Add(spare = group);
+                else Merge(i, spare);
+            }
+        }
+    }
+
+    /// <summary>Keeps the largest dead groups and puts the others together by type.</summary>
+    void LimitDead(bool[] reached)
+    {
+        var bytes = new Dictionary<int, long>();
+        for (int i = 0; i < _snapshot.Count; i++)
+            if (!reached[i] && !_snapshot.IsFree(i))
+                bytes[Group(i)] = bytes.GetValueOrDefault(Group(i)) + _snapshot.Size(i) + (IsAppType(i) ? 1L << 40 : 0);
+        if (bytes.Count <= MaxDead) return;
+        var byType = new Dictionary<int, int>();
+        int other = -1, buckets = 0;
+        foreach (int group in bytes.OrderByDescending(b => b.Value).Skip(MaxDead - 20).Select(b => b.Key))
+        {
+            if (byType.TryGetValue(_snapshot.TypeOf(group), out int bucket)) Merge(group, bucket);
+            else if (buckets++ < 19) byType[_snapshot.TypeOf(group)] = group;
+            else if (other < 0) other = group;
+            else Merge(group, other);
+        }
+    }
+
+    void Number(bool[] reached, int[] rootKind, int[] start, int[] targets, int[] parent)
+    {
+        int n = _snapshot.Count;
+        Array.Fill(NodeOf, -1);
+        var members = new List<List<int>>();
+        for (int i = 0; i < n; i++)
+        {
+            if (_snapshot.IsFree(i)) continue;
+            int group = Group(i);
+            if (NodeOf[group] < 0)
+            {
+                NodeOf[group] = members.Count;
+                members.Add([]);
+            }
+            NodeOf[i] = NodeOf[group];
+            members[NodeOf[i]].Add(i);
+        }
+
+        // Shuffled, or the numbering would give away the order objects were allocated in.
+        int[] order = [.. Enumerable.Range(0, members.Count)];
+        new Random((int)_snapshot.Pid ^ (int)_snapshot.Gc).Shuffle(order);
+        var renumber = new int[members.Count];
+        for (int i = 0; i < order.Length; i++) renumber[order[i]] = i;
+        for (int i = 0; i < n; i++)
+            if (NodeOf[i] >= 0) NodeOf[i] = renumber[NodeOf[i]];
+        foreach (int old in order)
+        {
+            int[] list = [.. members[old]];
+            var types = list.GroupBy(_snapshot.TypeOf).OrderByDescending(g => g.Sum(_snapshot.Size)).ToList();
+            // Named after the app's own type if there is one, else whatever takes the most space.
+            var main = types.FirstOrDefault(g => IsAppType(g.First())) ?? types[0];
+            string name = _snapshot.TypeNames[main.Key] + (types.Count > 1 ? $" and {types.Count - 1} more" : "");
+            Nodes.Add(new Node(name, list.Length, list.Sum(_snapshot.Size), list.Max(i => rootKind[i])));
+            Members.Add(list);
+        }
+
+        var seen = new HashSet<(int, int)>();
+        void Add(int from, int to)
+        {
+            int a = NodeOf[from], b = NodeOf[to];
+            if (a != b && seen.Add((a, b))) Edges.Add((a, b));
+        }
+        // First the edges that decide what is alive, then as many others as fit.
+        for (int i = 0; i < n; i++)
+            if (reached[i] && parent[i] >= 0) Add(parent[i], i);
+        for (int i = 0; i < n && Edges.Count < MaxEdges; i++)
+            for (int e = start[i]; e < start[i + 1] && Edges.Count < MaxEdges; e++) Add(i, targets[e]);
+    }
+
+    bool IsAppType(int i)
+    {
+        int type = _snapshot.TypeOf(i);
+        _isApp ??= [.. _snapshot.TypeNames.Select(IsAppName)];
+        return _isApp[type];
+    }
+    bool[]? _isApp;
+
+    static bool IsAppName(string name)
+    {
+        string element = name.TrimEnd('[', ']', ',', '*');
+        return !(element.StartsWith("System.") || element.StartsWith("Microsoft.") || element.StartsWith("Interop") ||
+            element.StartsWith("Internal.") || element.StartsWith("type 0x") || element is "free space") &&
+            !(element.Length > 0 && char.IsLower(element[0]) && !element.Contains('.'));
+    }
+}

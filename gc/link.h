@@ -6,6 +6,9 @@
 class ViewerLink
 {
 public:
+    // False when MANUALGC_PORT turns the viewer off.
+    static bool Enabled();
+
     // Returns false at once when no viewer is listening.
     bool Connect();
     void Close();

@@ -14,10 +14,15 @@ static int ViewerPort()
     return value == nullptr ? 5710 : atoi(value);
 }
 
-bool ViewerLink::Connect()
+bool ViewerLink::Enabled()
 {
     int port = ViewerPort();
-    if (port <= 0 || port > 65535)
+    return port > 0 && port <= 65535;
+}
+
+bool ViewerLink::Connect()
+{
+    if (!Enabled())
         return false;
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0)
@@ -31,7 +36,7 @@ bool ViewerLink::Connect()
 
     sockaddr_in address = {};
     address.sin_family = AF_INET;
-    address.sin_port = htons((uint16_t)port);
+    address.sin_port = htons((uint16_t)ViewerPort());
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(s, (sockaddr*)&address, sizeof(address)) != 0)
     {
@@ -103,7 +108,7 @@ bool ViewerLink::Read(void* data, size_t size)
         }
         else if (n == 0 || errno != EINTR)
         {
-            LogLine("the viewer is gone; resuming the app");
+            LogLine("the viewer is gone");
             Close();
         }
     }
@@ -117,7 +122,7 @@ uint8_t ViewerLink::Receive(const uint8_t** payload, size_t* size)
         return 0;
     if (length < 1 || length > sizeof(m_received))
     {
-        LogLine("bad message length %u from the viewer; resuming the app", length);
+        LogLine("bad message length %u from the viewer", length);
         Close();
         return 0;
     }
