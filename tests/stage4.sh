@@ -60,7 +60,7 @@ sleep 0.5
 grep -q resumed $OUT/killed.log && echo "the app did not wait" >> $OUT/killed.log
 stop_viewer
 wait $APP; rc=$?
-check "killing the viewer mid-collection resumes the app" 0 $rc $OUT/killed.log "the viewer is gone; resuming the app"
+check "killing the viewer mid-collection resumes the app" 0 $rc $OUT/killed.log "resuming the app without a Done"
 ! grep -q "did not wait" $OUT/killed.log; check "    and it was waiting until then" 0 $? $OUT/killed.log
 
 if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then

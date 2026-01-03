@@ -7,6 +7,10 @@
 //   bytes   in every collection, erase every byte[] without peeking, and print the score
 //   wait    do nothing and let the time run out
 //   hardcore  in one collection, turn hardcore on and erase every live Kept object
+//   flight  in every collection, get the object graph, work out from its arrows what no root reaches,
+//           and shoot all of that; prints a line if the graph would have misled a player
+//   strafe  in one collection, shoot one live node that stands for several objects, then crash once
+// A third argument of N asks the first attached app to collect every N milliseconds.
 // Modes that play every collection stop when the viewer goes away.
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
@@ -21,7 +25,21 @@ JsonElement info = default;
 uint[] words = [];
 byte[] live = [];
 var random = new Random(1);
-int rounds = 0, freed = 0, refused = 0, expected = 0;
+var sending = new SemaphoreSlim(1);
+int app = -1;
+if (args.Length > 2)
+{
+    var every = TimeSpan.FromMilliseconds(int.Parse(args[2]));
+    _ = Task.Run(async () =>
+    {
+        while (true)
+        {
+            await Task.Delay(every);
+            if (app >= 0) await Send(new { type = "collect", app });
+        }
+    });
+}
+int rounds = 0, freed = 0, refused = 0, expected = 0, waiting = 0;
 try
 {
     while (await Receive() is var (json, data))
@@ -31,6 +49,28 @@ try
             switch (message.GetProperty("type").GetString())
             {
                 case "snapshot": info = message; break;
+                case "apps":
+                    app = message.GetProperty("apps") is { } apps && apps.GetArrayLength() > 0 ? apps[0].GetProperty("id").GetInt32() : -1;
+                    Console.WriteLine($"apps {message.GetProperty("apps")}");
+                    break;
+                case "graph":
+                    await PlayGraph(message);
+                    break;
+                case "state" when mode == "strafe":
+                    Console.WriteLine($"after crash: {message.GetProperty("state")}");
+                    await Send(new { type = "done" });
+                    break;
+                case "erased" when mode is "flight" or "strafe":
+                    freed += message.GetProperty("freed").GetArrayLength();
+                    refused += message.GetProperty("live").GetArrayLength();
+                    foreach (JsonElement hit in message.GetProperty("hits").EnumerateArray()) waiting -= hit.GetProperty("count").GetInt32();
+                    if (mode == "strafe")
+                    {
+                        Console.WriteLine($"shot: {message.GetProperty("hits")} {message.GetProperty("state")}");
+                        await Send(new { type = "crash" });
+                    }
+                    else if (waiting == 0 || refused > 0) await Send(new { type = "done" });
+                    break;
                 case "erased":
                     freed += message.GetProperty("freed").GetArrayLength();
                     refused += message.GetProperty("live").GetArrayLength();
@@ -38,7 +78,7 @@ try
                     break;
                 case "resumed":
                     Console.WriteLine($"resumed: {message.GetProperty("reason").GetString()}, missed {message.GetProperty("missedBytes")}, {message.GetProperty("state")}");
-                    if (mode is "look" or "greedy" or "hardcore" or "wait") return 0;
+                    if (mode is "look" or "greedy" or "hardcore" or "wait" or "strafe") return 0;
                     break;
             }
             continue;
@@ -50,7 +90,11 @@ try
             rounds++;
             // A finished collection is sent to new pages too; there is nothing to play in it.
             if (!info.GetProperty("frozen").GetBoolean()) continue;
-            if (mode == "bytes")
+            if (mode is "flight" or "strafe")
+            {
+                await Send(new { type = "graph" });
+            }
+            else if (mode == "bytes")
             {
                 live = new byte[words[1]];
                 expected = live.Length;
@@ -101,6 +145,35 @@ async Task Play()
         if (expected == 0) await Send(new { type = "done" });
         await Erase(targets);
     }
+}
+
+async Task PlayGraph(JsonElement graph)
+{
+    if (graph.TryGetProperty("tooLarge", out _))
+    {
+        Console.WriteLine("too large for a graph");
+        await Send(new { type = "done" });
+        return;
+    }
+    JsonElement[] nodes = [.. graph.GetProperty("nodes").EnumerateArray()];
+    int[][] edges = [.. graph.GetProperty("edges").EnumerateArray().Select(e => new[] { e[0].GetInt32(), e[1].GetInt32() })];
+    ILookup<int, int> held = edges.ToLookup(e => e[0], e => e[1]);
+    var alive = new HashSet<int>();
+    var queue = new Queue<int>(Enumerable.Range(0, nodes.Length).Where(i => nodes[i].GetProperty("rootKind").GetInt32() >= 0));
+    while (queue.TryDequeue(out int i))
+        if (alive.Add(i))
+            foreach (int next in held[i]) queue.Enqueue(next);
+    int[] garbage = [.. Enumerable.Range(0, nodes.Length).Where(i => !alive.Contains(i))];
+    Console.WriteLine($"graph {graph.GetProperty("gc")}: {nodes.Length} nodes, {edges.Length} edges, {garbage.Length} loose, " +
+        $"{graph.GetProperty("disagreements")} disagreements with the GC");
+    if (mode == "strafe")
+    {
+        await Send(new { type = "shoot", node = alive.First(i => nodes[i].GetProperty("count").GetInt32() > 1) });
+        return;
+    }
+    waiting = garbage.Sum(i => nodes[i].GetProperty("count").GetInt32());
+    if (waiting == 0) await Send(new { type = "done" });
+    foreach (int i in garbage) await Send(new { type = "shoot", node = i });
 }
 
 async Task Erase(int[] targets)
@@ -175,4 +248,9 @@ async Task<(JsonElement? json, byte[] data)?> Receive()
     return (result.MessageType == WebSocketMessageType.Text ? JsonDocument.Parse(data).RootElement : null, data);
 }
 
-Task Send(object message) => socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(message), WebSocketMessageType.Text, true, CancellationToken.None);
+async Task Send(object message)
+{
+    await sending.WaitAsync();
+    try { await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(message), WebSocketMessageType.Text, true, CancellationToken.None); }
+    finally { sending.Release(); }
+}

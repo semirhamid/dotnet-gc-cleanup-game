@@ -14,8 +14,6 @@ server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(("127.0.0.1", port))
 server.listen(1)
 print("listening", flush=True)
-gc, _ = server.accept()
-gc.settimeout(20)
 
 def take(n):
     data = b""
@@ -36,10 +34,16 @@ def erase(addresses, flags=0):
     assert kind == 6
     return [data[i + 8] for i in range(0, len(data), 9)]
 
-objects, hello = [], None
-while True:
+# An app also opens a control connection, which says Attach (9). Wait for a collection.
+control, objects, hello = [], [], None
+while hello is None:
+    gc, _ = server.accept()
+    gc.settimeout(20)
     kind, data = message()
     if kind == 1: hello = struct.unpack("<IIIQQB", data)
+    else: control.append(gc)
+while True:
+    kind, data = message()
     if kind == 4: objects += [struct.unpack_from("<QQQ", data, i) for i in range(0, len(data), 24)]
     if kind == 5: break
 live = [o[0] for o in objects if o[1] & 1]
