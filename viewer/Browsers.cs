@@ -5,8 +5,8 @@ using System.Threading.Channels;
 namespace ManualGC.Viewer;
 
 /// <summary>
-/// One connected page. Messages go through a queue, so a page that reads slowly holds up neither the
-/// session nor the suspended app.
+/// One connected page. Messages are queued, so that a page which reads slowly cannot hold up the
+/// session or the suspended app.
 /// </summary>
 sealed class Browser(WebSocket socket)
 {
@@ -29,7 +29,6 @@ sealed class Browser(WebSocket socket)
         }
         catch (Exception e) when (e is WebSocketException or ObjectDisposedException or OperationCanceledException)
         {
-            // The page went away; its receive loop notices.
         }
     }
 }
@@ -68,7 +67,7 @@ sealed class Browsers
                 do
                 {
                     if (length == buffer.Length)
-                        return;  // no message from the page is this large
+                        return;
                     result = await socket.ReceiveAsync(buffer.AsMemory(length), stop);
                     length += result.Count;
                 } while (!result.EndOfMessage);
@@ -80,6 +79,7 @@ sealed class Browsers
         }
         catch (Exception e) when (e is WebSocketException or OperationCanceledException or JsonException or InvalidOperationException or KeyNotFoundException)
         {
+            // Closed, or sent something that makes no sense. Either way, drop the page.
         }
         finally
         {

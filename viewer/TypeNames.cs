@@ -23,8 +23,8 @@ sealed class TypeNames
         ["System.Decimal"] = "decimal",
     };
 
-    // Shared by every connection. Metadata for a path is read once, so restart the viewer after
-    // rebuilding a sample. Guarded by its own lock.
+    // Shared by every connection, and locked while in use. Each file is read only once, so the viewer
+    // has to be restarted after rebuilding an app.
     static readonly Dictionary<string, MetadataReader?> s_readers = [];
 
     readonly Dictionary<uint, string> _modules = [];

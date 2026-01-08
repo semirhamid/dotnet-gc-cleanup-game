@@ -19,10 +19,9 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
     public uint Gc => gc;
     public ulong Base => heapBase;
     public ulong End => end;
-    /// <summary>The app was started with MANUALGC_HARDCORE=1.</summary>
     public bool HardcoreAllowed => (flags & 1) != 0;
-    public TypeNames Names { get; } = new();
     public bool OutOfMemory => (flags & 2) != 0;
+    public TypeNames Names { get; } = new();
     public int Count => _offsets.Count;
     public int Shown => Math.Min(Count, MaxShown);
     public IReadOnlyList<string> TypeNames => _typeNames;
@@ -42,7 +41,6 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
         _live.Add((sizeAndFlags & 1) != 0);
     }
 
-    /// <summary>Index of the block at an address, or -1.</summary>
     public int Find(ulong address)
     {
         int i = address < heapBase ? -1 : _offsets.BinarySearch((uint)((address - heapBase) >> 3));
@@ -57,7 +55,6 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
         return bytes;
     }
 
-    /// <summary>Records that the GC freed a block.</summary>
     public void SetFree(int i)
     {
         _types[i] = 0;
@@ -72,16 +69,15 @@ sealed class Snapshot(uint pid, uint gc, ulong heapBase, ulong end, byte flags)
 
     public void AddRoot(ulong address, byte kind) => _roots.Add(((uint)((address - heapBase) >> 3), kind));
 
-    public int ReferenceCount => _from.Count;
     public int TypeOf(int i) => (int)_types[i];
 
-    /// <summary>References as block indexes. Both must be objects in this snapshot.</summary>
     public IEnumerable<(int From, int To)> References()
     {
         int from = 0;
         for (int e = 0; e < _from.Count; e++)
         {
-            // Sources arrive in address order, apart from the few from handles at the end.
+            // Sources arrive in address order, except for a few from handles at the end, so the last
+            // one found is usually right.
             if (_offsets[from] != _from[e])
                 from = _offsets.BinarySearch(_from[e]);
             int to = _offsets.BinarySearch(_to[e]);

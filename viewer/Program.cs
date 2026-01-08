@@ -10,8 +10,8 @@ int gcPort = builder.Configuration.GetValue("GcPort", 5710);
 
 builder.Logging.SetMinimumLevel(LogLevel.Warning).AddFilter("ManualGC", LogLevel.Information);
 builder.WebHost.ConfigureKestrel(o => o.ListenLocalhost(webPort));
-// Only loopback names, so a web page cannot reach this server by rebinding its own DNS name.
-builder.Configuration["AllowedHosts"] = "localhost;127.0.0.1;[::1]";
+// Only accept loopback host names. Otherwise a website could reach this server by pointing its own
+// DNS name at 127.0.0.1.
 builder.Services.Configure<Microsoft.AspNetCore.HostFiltering.HostFilteringOptions>(o =>
     o.AllowedHosts = ["localhost", "127.0.0.1", "[::1]"]);
 builder.Services.AddHostFiltering(_ => { });
@@ -38,7 +38,7 @@ app.Map("/ws", async (HttpContext context, Session session, Browsers browsers, I
         context.Response.StatusCode = StatusCodes.Status400BadRequest;
         return;
     }
-    // Browsers always send Origin, so a page from another site is turned away here.
+    // Browsers always send Origin, so this turns away pages from other sites.
     string? origin = context.Request.Headers.Origin;
     if (origin != null && origin != $"{context.Request.Scheme}://{context.Request.Host}")
     {
@@ -46,7 +46,7 @@ app.Map("/ws", async (HttpContext context, Session session, Browsers browsers, I
         return;
     }
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    // Open pages must not hold up shutting down.
+    // Without this, an open page would keep the viewer from shutting down.
     using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, lifetime.ApplicationStopping);
     await browsers.RunAsync(socket, session, stop.Token);
 });

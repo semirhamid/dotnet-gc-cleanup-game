@@ -1,27 +1,33 @@
 namespace ManualGC.Viewer;
 
 /// <summary>
-/// The heap as a small directed graph for the flight game. A node stands for one object or for many,
-/// but never for live and dead ones together, so a node is garbage exactly when no path of edges
-/// leads to it from a root node.
+/// The heap shrunk to a small directed graph for the flight game. A node can stand for many objects,
+/// but live and dead ones are never mixed in one node. So a node is garbage exactly when no path of
+/// edges leads to it from a root node.
 /// </summary>
 sealed class ObjectGraph
 {
     public const int MaxLive = 90, MaxDead = 60, MaxEdges = 700;
-    const int MaxSiblings = 5;   // nodes that many like objects with the same holder are split into
+    const int MaxSiblings = 5;      // nodes left when many objects of one type have the same holder
+    const int MaxDeadByType = 20;
+    const int FoldPasses = 4;
+
+    // Added to the size of an object of the app's own types, so that those always rank first.
+    const long AppTypeBonus = 1L << 40;
 
     public sealed record Node(string Type, int Count, long Bytes, int RootKind);
 
     public List<Node> Nodes { get; } = [];
-    public List<int[]> Members { get; } = [];  // block indexes, by node
+    public List<int[]> Members { get; } = [];
     public List<(int From, int To)> Edges { get; } = [];
     public int[] NodeOf { get; }               // by block, or -1
 
-    /// <summary>Objects whose liveness, worked out here from roots and references, differs from the GC's.</summary>
+    /// <summary>How many objects the GC calls live and this class dead, or the other way round. Should be 0.</summary>
     public int Disagreements { get; }
 
     readonly Snapshot _snapshot;
-    readonly int[] _merged;  // union-find
+    readonly int[] _merged;  // union-find: which block each block was merged into, or itself
+    bool[]? _isApp;
 
     public ObjectGraph(Snapshot snapshot)
     {
@@ -46,7 +52,7 @@ sealed class ObjectGraph
             queue.Add(block);
         }
 
-        // Mark again, breadth first, to learn the shortest way to everything.
+        // Mark again, breadth first, so that parent leads along a shortest path to a root.
         for (int at = 0; at < queue.Count; at++)
         {
             int from = queue[at];
@@ -67,7 +73,7 @@ sealed class ObjectGraph
             if (reached[i] != snapshot.IsLive(i)) Disagreements++;
         }
 
-        // Something holding each dead object, if anything does, preferring the first.
+        // For dead objects, parent is the first dead object that holds them, if any does.
         for (int i = 0; i < n; i++)
             if (!reached[i]) parent[i] = -1;
         for (int from = 0; from < n; from++)
@@ -107,13 +113,16 @@ sealed class ObjectGraph
 
     void Merge(int child, int into) => _merged[Group(child)] = Group(into);
 
-    /// <summary>Puts things that hold nothing and have one holder into that holder: the array inside a list, say.</summary>
+    /// <summary>
+    /// Merges objects that hold nothing and have a single holder into that holder. The array inside a
+    /// list becomes part of the list, for example.
+    /// </summary>
     void FoldLeaves(int[] start, int[] targets, bool[] reached, int[] rootKind)
     {
         int n = _snapshot.Count;
         var holder = new int[n];
         var holds = new bool[n];
-        for (int pass = 0; pass < 4; pass++)
+        for (int pass = 0; pass < FoldPasses; pass++)
         {
             Array.Fill(holder, -1);
             Array.Clear(holds);
@@ -131,7 +140,8 @@ sealed class ObjectGraph
             for (int i = 0; i < n; i++)
             {
                 if (_merged[i] != i || holds[i] || holder[i] < 0 || rootKind[i] >= 0 || reached[i] != reached[holder[i]]) continue;
-                // Keep the app's own objects on the map while there is room for them.
+                // Leave the app's own objects for the later passes, which only happen if this one
+                // found something else to merge.
                 if (pass == 0 && IsAppType(i)) continue;
                 Merge(i, holder[i]);
                 changed = true;
@@ -140,7 +150,6 @@ sealed class ObjectGraph
         }
     }
 
-    /// <summary>Joins objects of one type that are held by the same thing.</summary>
     void JoinSiblings(bool[] reached, int[] parent, int[] rootKind)
     {
         var families = new Dictionary<(bool, int, int, int), List<int>>();
@@ -159,10 +168,9 @@ sealed class ObjectGraph
         }
     }
 
-    /// <summary>Keeps the most interesting part of the live graph and folds the rest into what holds it.</summary>
     void LimitLive(List<int> order, int[] parent)
     {
-        // Worth following: subtrees with the app's own types in them, then large ones.
+        // A subtree is interesting if it has the app's own types in it, or else if it is large.
         var weight = new Dictionary<int, long>();
         var children = new Dictionary<int, List<int>>();
         var holder = new Dictionary<int, int>();
@@ -180,8 +188,8 @@ sealed class ObjectGraph
         }
         var own = new Dictionary<int, long>();
         foreach (int i in order)
-            own[Group(i)] = own.GetValueOrDefault(Group(i)) + _snapshot.Size(i) + (IsAppType(i) ? 1L << 40 : 0);
-        // Holders come before what they hold, so going backwards sees every subtree complete.
+            own[Group(i)] = own.GetValueOrDefault(Group(i)) + Interest(i);
+        // Holders come before what they hold. Going backwards, a subtree is complete when we get to it.
         foreach (int group in order.Select(Group).Distinct().Reverse())
         {
             weight[group] = weight.GetValueOrDefault(group) + own[group];
@@ -199,7 +207,7 @@ sealed class ObjectGraph
                 candidates.Enqueue(child, -weight.GetValueOrDefault(child));
         }
 
-        // Roots that did not make it share one node, since nothing on the map holds them.
+        // Roots that were not kept have no holder to merge into, so they share one node.
         int spare = -1;
         foreach (int i in order)
         {
@@ -214,20 +222,19 @@ sealed class ObjectGraph
         }
     }
 
-    /// <summary>Keeps the largest dead groups and puts the others together by type.</summary>
     void LimitDead(bool[] reached)
     {
-        var bytes = new Dictionary<int, long>();
+        var interest = new Dictionary<int, long>();
         for (int i = 0; i < _snapshot.Count; i++)
             if (!reached[i] && !_snapshot.IsFree(i))
-                bytes[Group(i)] = bytes.GetValueOrDefault(Group(i)) + _snapshot.Size(i) + (IsAppType(i) ? 1L << 40 : 0);
-        if (bytes.Count <= MaxDead) return;
+                interest[Group(i)] = interest.GetValueOrDefault(Group(i)) + Interest(i);
+        if (interest.Count <= MaxDead) return;
         var byType = new Dictionary<int, int>();
-        int other = -1, buckets = 0;
-        foreach (int group in bytes.OrderByDescending(b => b.Value).Skip(MaxDead - 20).Select(b => b.Key))
+        int other = -1, buckets = 0;  // the last bucket takes every type that has none of its own
+        foreach (int group in interest.OrderByDescending(p => p.Value).Skip(MaxDead - MaxDeadByType).Select(p => p.Key))
         {
             if (byType.TryGetValue(_snapshot.TypeOf(group), out int bucket)) Merge(group, bucket);
-            else if (buckets++ < 19) byType[_snapshot.TypeOf(group)] = group;
+            else if (buckets++ < MaxDeadByType - 1) byType[_snapshot.TypeOf(group)] = group;
             else if (other < 0) other = group;
             else Merge(group, other);
         }
@@ -251,7 +258,7 @@ sealed class ObjectGraph
             members[NodeOf[i]].Add(i);
         }
 
-        // Shuffled, or the numbering would give away the order objects were allocated in.
+        // Unshuffled, the numbers would give away the order in which objects were allocated.
         int[] order = [.. Enumerable.Range(0, members.Count)];
         new Random((int)_snapshot.Pid ^ (int)_snapshot.Gc).Shuffle(order);
         var renumber = new int[members.Count];
@@ -262,7 +269,6 @@ sealed class ObjectGraph
         {
             int[] list = [.. members[old]];
             var types = list.GroupBy(_snapshot.TypeOf).OrderByDescending(g => g.Sum(_snapshot.Size)).ToList();
-            // Named after the app's own type if there is one, else whatever takes the most space.
             var main = types.FirstOrDefault(g => IsAppType(g.First())) ?? types[0];
             string name = _snapshot.TypeNames[main.Key] + (types.Count > 1 ? $" and {types.Count - 1} more" : "");
             Nodes.Add(new Node(name, list.Length, list.Sum(_snapshot.Size), list.Max(i => rootKind[i])));
@@ -275,12 +281,14 @@ sealed class ObjectGraph
             int a = NodeOf[from], b = NodeOf[to];
             if (a != b && seen.Add((a, b))) Edges.Add((a, b));
         }
-        // First the edges that decide what is alive, then as many others as fit.
+        // The edges that decide what is alive must all be there. The others go in while there is room.
         for (int i = 0; i < n; i++)
             if (reached[i] && parent[i] >= 0) Add(parent[i], i);
         for (int i = 0; i < n && Edges.Count < MaxEdges; i++)
             for (int e = start[i]; e < start[i + 1] && Edges.Count < MaxEdges; e++) Add(i, targets[e]);
     }
+
+    long Interest(int i) => _snapshot.Size(i) + (IsAppType(i) ? AppTypeBonus : 0);
 
     bool IsAppType(int i)
     {
@@ -288,13 +296,15 @@ sealed class ObjectGraph
         _isApp ??= [.. _snapshot.TypeNames.Select(IsAppName)];
         return _isApp[type];
     }
-    bool[]? _isApp;
+
+    static readonly string[] s_frameworkPrefixes = ["System.", "Microsoft.", "Interop", "Internal.", "type 0x"];
 
     static bool IsAppName(string name)
     {
         string element = name.TrimEnd('[', ']', ',', '*');
-        return !(element.StartsWith("System.") || element.StartsWith("Microsoft.") || element.StartsWith("Interop") ||
-            element.StartsWith("Internal.") || element.StartsWith("type 0x") || element is "free space") &&
-            !(element.Length > 0 && char.IsLower(element[0]) && !element.Contains('.'));
+        if (element == "free space" || s_frameworkPrefixes.Any(element.StartsWith))
+            return false;
+        bool isKeyword = element.Length > 0 && char.IsLower(element[0]) && !element.Contains('.');
+        return !isKeyword;
     }
 }

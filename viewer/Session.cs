@@ -4,32 +4,32 @@ using System.Text.Json;
 namespace ManualGC.Viewer;
 
 /// <summary>
-/// The game: one round per collection. Holds the current collection, or the last one after the app
-/// resumed. The GC alone decides what may be freed; this keeps score.
+/// The game. Every collection is one round, and after a round its snapshot is kept until the next one
+/// starts. This only keeps score: the GC decides what may be freed.
 /// </summary>
 sealed class Session(Browsers browsers, GameRules rules)
 {
-    const int MaxBatch = 8000;
+    const int MaxBatch = 8000;  // addresses in one Erase; the GC accepts at most 64 KB
 
     readonly SemaphoreSlim _lock = new(1);
-    readonly Queue<int> _wanted = [];   // erase requests not sent yet
+    readonly Queue<int> _wanted = [];
     readonly HashSet<int> _asked = [];  // sent to the GC and not answered
     readonly HashSet<int> _knownLive = [];
     readonly List<AttachedApp> _apps = [];
     Snapshot? _snapshot;
-    ObjectGraph? _graph;  // made when a page first asks
-    Stream? _gc;  // set while the app is suspended
+    ObjectGraph? _graph;
+    Stream? _gc;          // set while the app is suspended
     int _lives;
     long _freedBytes;
     int _freedCount;
-    int _destroyed;     // live objects freed in hardcore mode
+    int _destroyed;
     bool _peeked;       // a round in which somebody looked at what is alive scores nothing
     bool _hardcore;
     string? _endReason;
     long _deadline;     // Environment.TickCount64, or 0 for no limit
     CancellationTokenSource? _timer;
     uint _pid;
-    long _totalScore;   // earlier rounds of the same process
+    long _totalScore;
 
     async Task Locked(Func<Task> action)
     {
@@ -83,7 +83,7 @@ sealed class Session(Browsers browsers, GameRules rules)
         _freedCount = 0;
         _destroyed = 0;
         _peeked = false;
-        _hardcore = false;  // asked for anew every time
+        _hardcore = false;  // has to be switched on again every round
         _endReason = null;
         StartTimer(snapshot);
         _wanted.Clear();
@@ -106,9 +106,6 @@ sealed class Session(Browsers browsers, GameRules rules)
         return Task.CompletedTask;
     });
 
-    /// <summary>What became of one node of the graph in a batch of results.</summary>
-    sealed record Hit(int Node, bool Live = false, int Count = 0, long Bytes = 0);
-
     void StartTimer(Snapshot snapshot)
     {
         _timer?.Cancel();
@@ -121,7 +118,8 @@ sealed class Session(Browsers browsers, GameRules rules)
 
         async Task Run()
         {
-            await Task.Delay(TimeSpan.FromSeconds(rules.Seconds), timer.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            await Task.Delay(TimeSpan.FromSeconds(rules.Seconds), timer.Token)
+                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             if (!timer.IsCancellationRequested)
                 await Locked(() => _snapshot == snapshot ? FinishAsync("time") : Task.CompletedTask);
         }
@@ -133,10 +131,12 @@ sealed class Session(Browsers browsers, GameRules rules)
             return;
         _endReason ??= reason;
         _wanted.Clear();
-        await SendToGcAsync(65, []);
+        await SendToGcAsync(MessageType.Done, []);
     }
 
-    public Task OnErasedAsync(List<(ulong Address, byte Status)> results) => Locked(async () =>
+    sealed record Hit(int Node, bool Live = false, int Count = 0, long Bytes = 0);
+
+    public Task OnErasedAsync(List<(ulong Address, EraseStatus Status)> results) => Locked(async () =>
     {
         if (_snapshot == null)
             return;
@@ -149,26 +149,28 @@ sealed class Session(Browsers browsers, GameRules rules)
             int i = _snapshot.Find(address);
             if (!_asked.Remove(i))
                 continue;
-            if (_graph != null && status != 2)
+            if (_graph != null && status != EraseStatus.NotAnObject)
             {
                 int node = _graph.NodeOf[i];
                 Hit hit = hits.GetValueOrDefault(node) ?? new Hit(node);
-                hits[node] = status == 1 ? hit with { Live = true } : hit with { Count = hit.Count + 1, Bytes = hit.Bytes + _snapshot.Size(i) };
+                hits[node] = status == EraseStatus.Alive
+                    ? hit with { Live = true }
+                    : hit with { Count = hit.Count + 1, Bytes = hit.Bytes + _snapshot.Size(i) };
             }
-            if (status == 0)
+            if (status == EraseStatus.Freed)
             {
                 freed.Add(i);
                 _freedBytes += _snapshot.Size(i);
                 _freedCount++;
                 _snapshot.SetFree(i);
             }
-            else if (status == 1)
+            else if (status == EraseStatus.Alive)
             {
                 live.Add(i);
                 _knownLive.Add(i);
                 _lives = Math.Max(0, _lives - 1);
             }
-            else if (status == 3)
+            else if (status == EraseStatus.Destroyed)
             {
                 destroyed.Add(i);
                 _destroyed++;
@@ -195,7 +197,7 @@ sealed class Session(Browsers browsers, GameRules rules)
         return Task.CompletedTask;
     });
 
-    /// <summary>Adds a page and brings it up to date, with no update slipping in between.</summary>
+    /// <summary>Adds a page and brings it up to date. Both under the lock, so that it misses no update.</summary>
     public Task JoinAsync(Browser browser, Action add) => Locked(() =>
     {
         add();
@@ -226,24 +228,10 @@ sealed class Session(Browsers browsers, GameRules rules)
                 break;
             case "collect" when _gc == null:
                 if (_apps.Find(a => a.Id == message.GetProperty("app").GetInt32()) is { } app)
-                    await WriteAsync(app.Stream, 66, []);
+                    await WriteAsync(app.Stream, MessageType.Collect, []);
                 break;
             case "graph" when _snapshot != null:
-                if (_snapshot.Count > Snapshot.MaxShown)
-                {
-                    browser.Send(new { type = "graph", gc = _snapshot.Gc, tooLarge = true });
-                    break;
-                }
-                _graph ??= new ObjectGraph(_snapshot);
-                browser.Send(new
-                {
-                    type = "graph",
-                    gc = _snapshot.Gc,
-                    nodes = _graph.Nodes,
-                    edges = _graph.Edges.Select(e => new[] { e.From, e.To }),
-                    disagreements = _graph.Disagreements,
-                    gone = Enumerable.Range(0, _graph.Nodes.Count).Where(i => _graph.Members[i].All(_snapshot.IsFree)),
-                });
+                SendGraph(browser, _snapshot);
                 break;
             case "shoot" when _snapshot != null && _graph != null && _gc != null:
                 await ShootAsync(message.GetProperty("node").GetInt32());
@@ -258,9 +246,28 @@ sealed class Session(Browsers browsers, GameRules rules)
         }
     });
 
+    void SendGraph(Browser browser, Snapshot snapshot)
+    {
+        if (snapshot.Count > Snapshot.MaxShown)
+        {
+            browser.Send(new { type = "graph", gc = snapshot.Gc, tooLarge = true });
+            return;
+        }
+        _graph ??= new ObjectGraph(snapshot);
+        browser.Send(new
+        {
+            type = "graph",
+            gc = snapshot.Gc,
+            nodes = _graph.Nodes,
+            edges = _graph.Edges.Select(e => new[] { e.From, e.To }),
+            disagreements = _graph.Disagreements,
+            gone = Enumerable.Range(0, _graph.Nodes.Count).Where(i => _graph.Members[i].All(snapshot.IsFree)),
+        });
+    }
+
     /// <summary>
-    /// Erases everything a node stands for. A live node costs one life however many objects it is, so
-    /// only one of them is put to the GC.
+    /// Erases everything a node stands for. A live node costs one life however many objects are in it,
+    /// so the GC is asked about only one of them.
     /// </summary>
     async Task ShootAsync(int node)
     {
@@ -281,8 +288,8 @@ sealed class Session(Browsers browsers, GameRules rules)
     }
 
     /// <summary>
-    /// Sends the next batch. Only one is ever unanswered: the GC does not read while it writes
-    /// results, so more could leave both sides blocked on full socket buffers.
+    /// Sends the next batch, once the last one has been answered. The GC does not read while it writes
+    /// results, so with two on the way both sides could end up blocked on full socket buffers.
     /// </summary>
     async Task SendWantedAsync()
     {
@@ -296,7 +303,7 @@ sealed class Session(Browsers browsers, GameRules rules)
             if (i < 0 || i >= _snapshot.Shown || _snapshot.IsFree(i) || shielded || !_asked.Add(i))
                 continue;
             if (_snapshot.IsLive(i) && !_hardcore)
-                lives--;  // so one batch cannot cost more lives than are left
+                lives--;  // stops the batch before it costs more lives than there are
             addresses.Add(_snapshot.Address(i));
         }
         if (addresses.Count == 0)
@@ -306,16 +313,17 @@ sealed class Session(Browsers browsers, GameRules rules)
         BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(1), addresses.Count);
         for (int i = 0; i < addresses.Count; i++)
             BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(5 + i * 8), addresses[i]);
-        await SendToGcAsync(64, payload);
+        await SendToGcAsync(MessageType.Erase, payload);
     }
 
-    Task SendToGcAsync(byte type, byte[] payload) => _gc == null ? Task.CompletedTask : WriteAsync(_gc, type, payload);
+    Task SendToGcAsync(MessageType type, byte[] payload) =>
+        _gc == null ? Task.CompletedTask : WriteAsync(_gc, type, payload);
 
-    static async Task WriteAsync(Stream stream, byte type, byte[] payload)
+    static async Task WriteAsync(Stream stream, MessageType type, byte[] payload)
     {
         var message = new byte[5 + payload.Length];
         BinaryPrimitives.WriteInt32LittleEndian(message, 1 + payload.Length);
-        message[4] = type;
+        message[4] = (byte)type;
         payload.CopyTo(message, 5);
         try
         {
@@ -323,10 +331,8 @@ sealed class Session(Browsers browsers, GameRules rules)
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException)
         {
-            // The reader notices that the app is gone.
         }
     }
 }
 
-/// <param name="Seconds">Length of a round; 0 for no limit.</param>
 sealed record GameRules(int Lives, int Seconds);

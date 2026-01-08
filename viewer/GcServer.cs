@@ -1,36 +1,15 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 
 namespace ManualGC.Viewer;
 
-/// <summary>Reads one message payload.</summary>
-sealed class ProtocolReader(byte[] buffer, int start, int end)
-{
-    int _at = start;
-    public int Remaining => end - _at;
-    ReadOnlySpan<byte> Take(int n)
-    {
-        if (Remaining < n)
-            throw new InvalidDataException("message too short");
-        _at += n;
-        return buffer.AsSpan(_at - n, n);
-    }
-    public byte U8() => Take(1)[0];
-    public ushort U16() => BinaryPrimitives.ReadUInt16LittleEndian(Take(2));
-    public uint U32() => BinaryPrimitives.ReadUInt32LittleEndian(Take(4));
-    public ulong U64() => BinaryPrimitives.ReadUInt64LittleEndian(Take(8));
-    public string Rest() => Encoding.UTF8.GetString(Take(Remaining));
-}
-
-/// <summary>An app that is running under the GC and can be asked to collect.</summary>
 sealed record AttachedApp(int Id, uint Pid, string Name, Stream Stream);
 
 /// <summary>
-/// Accepts connections from apps. The first message tells a control connection from a collection.
-/// Collections are played one at a time; another app's waits, suspended, for its turn. The protocol is
-/// in docs/protocol.md.
+/// Accepts connections from apps. The first message says whether it is a control connection or a
+/// collection. Only one collection is played at a time; any other app that wants one stays suspended
+/// until it is its turn. The protocol is in docs/protocol.md.
 /// </summary>
 sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : BackgroundService
 {
@@ -55,7 +34,7 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
             byte[]? first = await ReadAsync(stream, stop);
             if (first == null)
                 return;
-            if (first[0] == 9)
+            if ((MessageType)first[0] == MessageType.Attach)
                 await ServeAppAsync(stream, first, stop);
             else
                 await ServeCollectionAsync(stream, first, stop);
@@ -93,6 +72,7 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
         await session.AttachAsync(app);
         try
         {
+            // Apps have nothing more to say. This only waits for the connection to close.
             while (await ReadAsync(stream, stop) != null) { }
         }
         finally
@@ -121,11 +101,11 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
         for (byte[]? next = message; next != null; next = await ReadAsync(stream, stop))
         {
             var reader = new ProtocolReader(next, 1, next.Length);
-            byte type = next[0];
-            if (type == 1)
+            var type = (MessageType)next[0];
+            if (type == MessageType.Hello)
             {
                 uint version = reader.U32();
-                if (version != 3)
+                if (version != ProtocolReader.Version)
                     throw new InvalidDataException($"protocol version {version}");
                 snapshot = new Snapshot(reader.U32(), reader.U32(), reader.U64(), reader.U64(), reader.U8());
                 continue;
@@ -134,31 +114,25 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
                 throw new InvalidDataException("no Hello");
             switch (type)
             {
-                case 2:
+                case MessageType.Module:
                     snapshot.Names.AddModule(reader.U32(), reader.Rest());
                     break;
-                case 3:
+                case MessageType.Type:
                     snapshot.Names.AddType(reader);
                     break;
-                case 4:
+                case MessageType.Objects:
                     while (reader.Remaining > 0)
                         snapshot.Add(reader.U64(), reader.U64(), reader.U64());
                     break;
-                case 6:
-                    var results = new List<(ulong Address, byte Status)>();
-                    while (reader.Remaining > 0)
-                        results.Add((reader.U64(), reader.U8()));
-                    await session.OnErasedAsync(results);
-                    break;
-                case 7:
+                case MessageType.References:
                     while (reader.Remaining > 0)
                         snapshot.AddReference(reader.U64(), reader.U64());
                     break;
-                case 8:
+                case MessageType.Roots:
                     while (reader.Remaining > 0)
                         snapshot.AddRoot(reader.U64(), reader.U8());
                     break;
-                case 5:
+                case MessageType.SnapshotEnd:
                     ulong count = reader.U64();
                     if (count != (ulong)snapshot.Count)
                         throw new InvalidDataException($"got {snapshot.Count} of {count} objects");
@@ -166,8 +140,14 @@ sealed class GcServer(GcPort port, Session session, ILogger<GcServer> log) : Bac
                         snapshot.Gc, snapshot.Pid, snapshot.Count, snapshot.End - snapshot.Base);
                     await session.BeginAsync(snapshot, stream);
                     break;
+                case MessageType.EraseResults:
+                    var results = new List<(ulong Address, EraseStatus Status)>();
+                    while (reader.Remaining > 0)
+                        results.Add((reader.U64(), (EraseStatus)reader.U8()));
+                    await session.OnErasedAsync(results);
+                    break;
                 default:
-                    throw new InvalidDataException($"unknown message {type}");
+                    throw new InvalidDataException($"unknown message {next[0]}");
             }
         }
     }
