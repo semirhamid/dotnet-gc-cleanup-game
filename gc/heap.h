@@ -10,27 +10,25 @@ class Heap
 public:
     static constexpr size_t CommitStep = 16 * 1024 * 1024;
     static constexpr size_t DefaultReserve = 32ull * 1024 * 1024 * 1024;
-    static constexpr size_t ChunkSize = 64 * 1024;       // one allocation context refill
-    static constexpr size_t DirectThreshold = 8 * 1024;  // this size and up bypass contexts
+    static constexpr size_t ChunkSize = 64 * 1024;
+    static constexpr size_t DirectThreshold = 8 * 1024;
 
     static constexpr size_t MinHoleForContext = 4 * 1024; // smaller holes get single objects
     static constexpr size_t MaxFreeObject = 1ull << 31;
 
-    // Reserves the heap and card tables and tells the runtime's write barrier about them.
     static bool Initialize(size_t reserveBytes, MethodTable* freeObjectMT);
 
     static Object* Alloc(gc_alloc_context* ctx, size_t size, uint32_t flags);
 
-    // Plugs the unused tail of a context with a free object and empties the context. The VM
-    // discounts the tail itself when a thread dies (vm/threads.cpp:2783), so it passes false.
+    // Plugs the unused tail of a context with a free object and empties the context. discountTail
+    // takes the tail off the allocation total; the VM does that itself when a thread dies
+    // (vm/threads.cpp:2783).
     static void RetireContext(gc_alloc_context* ctx, bool discountTail);
 
-    // ---- EE suspended only ----
+    // The following may only be called while the EE is suspended.
 
-    // Retires every thread's context, which makes the whole heap walkable.
     static void RetireAllContexts();
 
-    // Calls fn(uint8_t* obj, size_t size, bool isFree) for everything in the heap, in order.
     template <typename Fn>
     static void Walk(Fn fn)
     {
@@ -45,8 +43,9 @@ public:
         }
     }
 
-    // One bit per 8 bytes for each of "a live-or-dead object starts here" and "marked".
-    static void RebuildStartBits();  // also clears the mark bits
+    // Two bitmaps with one bit per 8 bytes of heap. A start bit says that an object, live or dead,
+    // starts there; a mark bit says that the object is alive. Rebuilding clears the mark bits.
+    static void RebuildStartBits();
     static bool IsObjectStart(const void* p) { return TestBit(s_startBits, p); }
     static bool IsMarked(const void* p) { return TestBit(s_markBits, p); }
     static bool TestAndMark(const void* p)
@@ -60,13 +59,11 @@ public:
     // The object whose [obj, obj + size) contains p, which must be inside the heap.
     static uint8_t* FindObject(const void* p);
 
-    // Turns an object into free space. Sweep makes it available to the allocator.
     static void Erase(uint8_t* obj);
 
-    // Merges neighbouring free objects and rebuilds the free lists.
     static void Sweep();
 
-    // ---- any time ----
+    // The rest may be called at any time.
 
     static bool Contains(const void* p)
     {
@@ -83,7 +80,6 @@ public:
 
     static void MakeFreeObject(uint8_t* p, size_t size);
 
-    // Free space on the lists, as of now.
     static size_t FreeListBytes() { return __atomic_load_n(&s_freeListBytes, __ATOMIC_RELAXED); }
 
 private:

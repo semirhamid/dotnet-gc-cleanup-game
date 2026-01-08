@@ -11,23 +11,24 @@
 
 namespace
 {
-    // The heap has no generations. Three are reported because code asks for generation 2 by
-    // number; every object is in the oldest one, so nothing is ever ephemeral.
+    // There are no generations, but plenty of code asks for generation 2 by number. Report three
+    // and put every object in the oldest, so that nothing is ever ephemeral.
     constexpr unsigned MaxGeneration = 2;
 
     bool s_gcInProgress;
-    uint32_t s_suspensions;  // reported at shutdown; the VM suspends for more than collections
+    uint32_t s_suspensions;
 
-    // Threads returning to managed code during any EE suspension block on this event, so it
-    // works from the start even though nothing collects yet. It begins signalled.
+    // Threads returning to managed code during an EE suspension block on this event. The VM suspends
+    // for other reasons than collections and relies on it then too. It begins signalled.
     pthread_mutex_t s_eventLock = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t s_eventCond = PTHREAD_COND_INITIALIZER;
     bool s_eventSignalled = true;
-    uint64_t s_eventSets;  // a waiter is released by any Set, even if a Reset follows before it runs
+    // Counts Sets, so that a waiter is released even if a Reset follows before it gets to run.
+    uint64_t s_eventSets;
 
     // Values from GC.CoreCLR.cs / gcpriv.h pause modes: 0 batch (blocking), 4 no-GC region.
     int s_latencyMode = 0;
-    int s_lohCompactionMode = 1;  // GCLargeObjectHeapCompactionMode.Default
+    int s_lohCompactionMode = 1;
     bool s_noGCRegion;
 
     struct FrozenSegment
@@ -57,13 +58,11 @@ namespace
     }
 }
 
-// ---- Hosting ----
 bool ManualGCHeap::IsValidSegmentSize(size_t) { return true; }
 bool ManualGCHeap::IsValidGen0MaxSize(size_t) { return true; }
 size_t ManualGCHeap::GetValidSegmentSize(bool) { return Heap::ReservedBytes(); }
 void ManualGCHeap::SetReservedVMLimit(size_t) {}
 
-// ---- Concurrent GC: there is none ----
 void ManualGCHeap::WaitUntilConcurrentGCComplete() {}
 bool ManualGCHeap::IsConcurrentGCInProgress() { return false; }
 void ManualGCHeap::TemporaryEnableConcurrentGC() {}
@@ -71,7 +70,6 @@ void ManualGCHeap::TemporaryDisableConcurrentGC() {}
 bool ManualGCHeap::IsConcurrentGCEnabled() { return false; }
 HRESULT ManualGCHeap::WaitUntilConcurrentGCCompleteAsync(int) { return S_OK; }
 
-// ---- Finalization: accepted, never run ----
 size_t ManualGCHeap::GetNumberOfFinalizable() { return 0; }
 Object* ManualGCHeap::GetNextFinalizable() { return nullptr; }
 bool ManualGCHeap::RegisterForFinalization(int, Object*) { return true; }
@@ -82,7 +80,6 @@ void ManualGCHeap::SetFinalizationRun(Object* obj)
     ((ObjHeader*)obj - 1)->SetBit(BIT_SBLK_FINALIZER_RUN);
 }
 
-// ---- BCL ----
 void ManualGCHeap::GetMemoryInfo(uint64_t* highMemLoadThresholdBytes, uint64_t* totalAvailableMemoryBytes,
                                  uint64_t* lastRecordedMemLoadBytes, uint64_t* lastRecordedHeapSizeBytes,
                                  uint64_t* lastRecordedFragmentationBytes, uint64_t* totalCommittedBytes,
@@ -117,9 +114,9 @@ int ManualGCHeap::GetGcLatencyMode() { return s_noGCRegion ? 4 : s_latencyMode; 
 int ManualGCHeap::SetGcLatencyMode(int newLatencyMode)
 {
     if (s_noGCRegion)
-        return 1;  // set_pause_mode_no_gc
+        return 1;
     s_latencyMode = newLatencyMode;
-    return 0;  // set_pause_mode_success
+    return 0;
 }
 
 int ManualGCHeap::GetLOHCompactionMode() { return s_lohCompactionMode; }
@@ -159,8 +156,8 @@ uint64_t ManualGCHeap::GetTotalAllocatedBytes() { return Heap::TotalAllocated();
 
 HRESULT ManualGCHeap::GarbageCollect(int, bool, int mode)
 {
-    // Memory pressure requests from the VM are non-blocking (vm/comutilnative.cpp:1472). Only
-    // GC.Collect() and other explicit blocking requests are a person's decision.
+    // Only blocking requests, such as GC.Collect(), are worth freezing the app for. The VM's own
+    // memory pressure requests are non-blocking (vm/comutilnative.cpp:1472) and are ignored.
     if ((mode & collection_non_blocking) == 0)
         Collector::Collect(false);
     return S_OK;
@@ -173,7 +170,6 @@ size_t ManualGCHeap::GetLastGCGenerationSize(int gen)
     return gen == (int)MaxGeneration ? Collector::GetTotals().heapBytes : 0;
 }
 
-// ---- Used throughout the VM ----
 HRESULT ManualGCHeap::Initialize()
 {
     size_t reserve = Heap::DefaultReserve;
@@ -238,18 +234,22 @@ void ManualGCHeap::SetYieldProcessorScalingFactor(float) {}
 // Not called on a normal exit, so the statistics are logged from atexit instead.
 void ManualGCHeap::Shutdown() {}
 
-// ---- Memory pressure timing ----
 size_t ManualGCHeap::GetLastGCStartTime(int) { return 0; }
 size_t ManualGCHeap::GetLastGCDuration(int) { return 0; }
 size_t ManualGCHeap::GetNow() { return (size_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000); }
 
-// ---- Allocation ----
 Object* ManualGCHeap::Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags)
 {
     Object* obj = Heap::Alloc(acontext, size, flags);
-    // Other threads may take what a collection freed before this one gets to it.
-    for (int tries = 0; obj == nullptr && tries < 4 && ViewerLink::Enabled() && size <= Heap::ReservedBytes() && Collector::CollectForAllocation(); tries++)
+    // More than one try, because other threads may take what a collection freed before this one
+    // gets to it.
+    constexpr int MaxTries = 4;
+    for (int tries = 0; obj == nullptr && tries < MaxTries; tries++)
+    {
+        if (!ViewerLink::Enabled() || size > Heap::ReservedBytes() || !Collector::CollectForAllocation())
+            break;
         obj = Heap::Alloc(acontext, size, flags);
+    }
     return obj;
 }
 
@@ -271,7 +271,6 @@ void ManualGCHeap::ResetWaitForGCEvent()
     pthread_mutex_unlock(&s_eventLock);
 }
 
-// ---- Heap verification ----
 bool ManualGCHeap::IsLargeObject(Object* pObj)
 {
     return Heap::Contains(pObj) && ObjectSize(pObj) >= LARGE_OBJECT_SIZE;
@@ -289,7 +288,6 @@ Object* ManualGCHeap::NextObj(Object* object)
 
 Object* ManualGCHeap::GetContainingObject(void* pInteriorPtr, bool) { return Collector::FindObject(pInteriorPtr); }
 
-// ---- Profiling and tracing ----
 void ManualGCHeap::DiagWalkObject(Object*, walk_fn, void*) {}
 void ManualGCHeap::DiagWalkObject2(Object*, walk_fn2, void*) {}
 void ManualGCHeap::DiagWalkHeap(walk_fn, void*, int, bool) {}
@@ -311,13 +309,12 @@ void ManualGCHeap::DiagGetGCSettings(EtwGCSettingsInfo* settings)
 
 bool ManualGCHeap::StressHeap(gc_alloc_context*) { return false; }
 
-// ---- Frozen segments ----
 segment_handle ManualGCHeap::RegisterFrozenSegment(segment_info* info)
 {
     FrozenSegment* segment = new (nothrow) FrozenSegment();
     if (segment == nullptr)
         return nullptr;
-    uint8_t* base = (uint8_t*)info->pvMem;  // field meanings: gcinterface.h:233-240
+    uint8_t* base = (uint8_t*)info->pvMem;
     segment->first = base + info->ibFirstObject;
     segment->allocated = base + info->ibAllocated;
     segment->committed = base + info->ibCommit;
@@ -341,8 +338,8 @@ void ManualGCHeap::UnregisterFrozenSegment(segment_handle seg)
     delete (FrozenSegment*)seg;
 }
 
-// The range covers the whole reservation, so objects in a segment count as frozen before the
-// VM reports the segment's new allocated limit through UpdateFrozenSegment.
+// Checks against the whole reservation. The VM reports a new allocated limit (UpdateFrozenSegment)
+// only after it has put objects there, and those must already count as frozen.
 bool ManualGCHeap::IsInFrozenSegment(Object* object)
 {
     if (Heap::Contains(object))
@@ -363,7 +360,6 @@ void ManualGCHeap::UpdateFrozenSegment(segment_handle seg, uint8_t* allocated, u
     pthread_mutex_unlock(&s_frozenLock);
 }
 
-// ---- Everything else ----
 void ManualGCHeap::ControlEvents(GCEventKeyword, GCEventLevel) {}
 void ManualGCHeap::ControlPrivateEvents(GCEventKeyword, GCEventLevel) {}
 

@@ -1,4 +1,3 @@
-// Reading objects: size and reference slots.
 #pragma once
 
 #include "platform.h"

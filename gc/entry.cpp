@@ -1,4 +1,3 @@
-// The two exports the runtime looks up: GC_VersionInfo and GC_Initialize (gcinterface.h:1169-1178).
 #include "gcheap.h"
 #include "handles.h"
 

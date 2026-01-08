@@ -7,11 +7,9 @@
 class TypeDescriber
 {
 public:
-    // Forgets what was sent; call once per connection.
     void Reset();
     void Free();
 
-    // Sends whatever the viewer needs to know about a type, once.
     void Send(ViewerLink& link, MethodTable* mt) { SendHandle(link, (uintptr_t)mt, 0); }
 
 private:
@@ -23,7 +21,6 @@ private:
 
     void SendHandle(ViewerLink& link, uintptr_t handle, int depth);
     uint32_t SendModule(ViewerLink& link, uintptr_t module);
-    // Returns the entry for key, adding it if needed.
     Entry* Find(uintptr_t key, bool* added);
 
     Entry* m_entries = nullptr;

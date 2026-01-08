@@ -1,6 +1,7 @@
 #include "attach.h"
 #include "collector.h"
 #include "link.h"
+#include "protocol.h"
 
 #include <crt_externs.h>
 #include <string.h>
@@ -10,7 +11,6 @@ namespace
 {
     ViewerLink s_control;
 
-    // The app's dll if the command line names one, else the program.
     const char* AppName()
     {
         int count = *_NSGetArgc();
@@ -28,13 +28,13 @@ namespace
     {
         for (;;)
         {
-            // Also the wait between attempts, and before the first, so the runtime gets to start.
+            // Retry once a second. The sleep comes first so that the runtime can finish starting.
             sleep(1);
             if (!s_control.Connect())
                 continue;
             const char* name = AppName();
             size_t length = strlen(name);
-            s_control.Begin(9);
+            s_control.Begin(Protocol::Attach);
             s_control.U32((uint32_t)getpid());
             s_control.Append(name, length < 4096 ? length : 4096);
             s_control.End();
@@ -43,8 +43,10 @@ namespace
             const uint8_t* payload;
             size_t size;
             while (uint8_t type = s_control.Receive(&payload, &size))
-                if (type == 66)
+            {
+                if (type == Protocol::Collect)
                     Collector::Collect(false);
+            }
             s_control.Close();
         }
     }
@@ -54,8 +56,8 @@ void Attach::Start()
 {
     if (!ViewerLink::Enabled())
         return;
-    // Not suspendable, like the stock server GC's threads, which also suspend the EE: it runs no
-    // managed code, so a collection need not wait for it.
+    // "false" makes the thread not suspendable, as the stock server GC does for its own threads.
+    // It never runs managed code, so a collection has no reason to wait for it.
     if (!g_ee->CreateThread(Run, nullptr, false, "manualgc viewer"))
         LogLine("could not start the viewer thread; only GC.Collect() will start collections");
 }

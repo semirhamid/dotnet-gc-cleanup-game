@@ -3,6 +3,5 @@
 
 namespace Attach
 {
-    // Starts a native thread that stays connected to the viewer and collects when told to.
     void Start();
 }

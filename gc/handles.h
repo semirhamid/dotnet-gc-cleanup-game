@@ -8,16 +8,16 @@
 struct HandleSlot
 {
     Object* object;
-    Object* secondary;   // HNDTYPE_DEPENDENT only
+    Object* secondary;
     uintptr_t extraInfo; // free-list link while the slot is free
-    uint32_t type;       // HandleType, or FreeType
+    uint32_t type;
     uint32_t unused;
 
     static constexpr uint32_t FreeType = 0xFFFFFFFF;
 };
 static_assert(sizeof(HandleSlot) == 32 && offsetof(HandleSlot, object) == 0, "handle slot layout");
 
-class HandleStore final : public IGCHandleStore  // gcinterface.h:578-594
+class HandleStore final : public IGCHandleStore
 {
 public:
     void Uproot() override;
@@ -28,7 +28,7 @@ public:
     OBJECTHANDLE CreateDependentHandle(Object* primary, Object* secondary) override;
 };
 
-class HandleManager final : public IGCHandleManager  // gcinterface.h:596-634
+class HandleManager final : public IGCHandleManager
 {
 public:
     bool Initialize() override;

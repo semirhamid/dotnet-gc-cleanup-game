@@ -12,7 +12,6 @@ static_assert(EE_INTERFACE_MAJOR_VERSION == 4, "written against EE interface 4 (
 static_assert(sizeof(gc_alloc_context) == 56, "gc_alloc_context layout (gcinterface.h:201-225)");
 static_assert(min_obj_size == 24, "minimum object size (gcinterface.h:250)");
 
-// Set from GC_Initialize.
 extern IGCToCLR* g_ee;
 
 // MANUALGC_LOG: 0 off, 1 summaries, 2 also counts per type.

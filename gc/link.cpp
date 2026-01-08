@@ -57,7 +57,7 @@ void ViewerLink::Close()
 
 void ViewerLink::Begin(uint8_t type)
 {
-    // Leave room for the length; End fills it in. Messages are kept well below the buffer size.
+    // Callers keep messages well under half the buffer. Leave room for the length, which End fills in.
     if (m_used > sizeof(m_buffer) / 2)
         Flush();
     m_messageStart = m_used;

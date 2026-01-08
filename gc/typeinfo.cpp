@@ -1,4 +1,5 @@
 #include "typeinfo.h"
+#include "protocol.h"
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -91,8 +92,9 @@ namespace
     constexpr uint32_t CategoryArrayMask = 0x000C0000, CategoryArray = 0x00080000, SzArray = 0x00020000;
     constexpr uint32_t GenericsMask = 0x30;
 
-    // Element types (ECMA-335 II.23.1.16).
     constexpr uint8_t ElementPtr = 0x0f, ElementByRef = 0x10;
+
+    constexpr int MaxTypeDepth = 32;
 
     size_t ToUtf8(const char16_t* text, char* out, size_t capacity)
     {
@@ -187,7 +189,7 @@ uint32_t TypeDescriber::SendModule(ViewerLink& link, uintptr_t module)
         char path[4096];
         const char16_t* text = Read<const char16_t*>(module + GetOffsets().modulePath);
         size_t length = text == nullptr ? 0 : ToUtf8(text, path, sizeof(path));
-        link.Begin(2);
+        link.Begin(Protocol::Module);
         link.U32(entry->id);
         link.Append(path, length);
         link.End();
@@ -205,11 +207,11 @@ void TypeDescriber::SendHandle(ViewerLink& link, uintptr_t handle, int depth)
         return;
 
     const Offsets& o = GetOffsets();
-    if (!o.valid || depth > 32)
+    if (!o.valid || depth > MaxTypeDepth)
     {
-        link.Begin(3);
+        link.Begin(Protocol::Type);
         link.U64(handle);
-        link.U8(4);
+        link.U8(Protocol::OtherType);
         link.U8(0);
         link.End();
         return;
@@ -221,16 +223,16 @@ void TypeDescriber::SendHandle(ViewerLink& link, uintptr_t handle, int depth)
         bool hasElement = element == ElementPtr || element == ElementByRef;
         uintptr_t inner = hasElement ? Read<uintptr_t>(handle - 2 + o.typeDescArg) : 0;
         SendHandle(link, inner, depth + 1);
-        link.Begin(3);
+        link.Begin(Protocol::Type);
         link.U64(handle);
         if (hasElement)
         {
-            link.U8(element == ElementPtr ? 2 : 3);
+            link.U8(element == ElementPtr ? Protocol::PointerType : Protocol::ByRefType);
             link.U64(inner);
         }
         else
         {
-            link.U8(4);
+            link.U8(Protocol::OtherType);
             link.U8(element);
         }
         link.End();
@@ -251,9 +253,9 @@ void TypeDescriber::SendHandle(ViewerLink& link, uintptr_t handle, int depth)
             rank = Read<uint8_t>(eeClass + o.arrayRank);
         }
         SendHandle(link, element, depth + 1);
-        link.Begin(3);
+        link.Begin(Protocol::Type);
         link.U64(handle);
-        link.U8(1);
+        link.U8(Protocol::ArrayType);
         link.U8(rank);
         link.U8(isVector);
         link.U64(element);
@@ -275,9 +277,9 @@ void TypeDescriber::SendHandle(ViewerLink& link, uintptr_t handle, int depth)
             SendHandle(link, args[i], depth + 1);
     }
     uint32_t module = SendModule(link, Read<uintptr_t>(handle + o.module));
-    link.Begin(3);
+    link.Begin(Protocol::Type);
     link.U64(handle);
-    link.U8(0);
+    link.U8(Protocol::NamedType);
     link.U32(module);
     link.U32(0x02000000 | Read<uint32_t>(handle + o.flags2) >> 8);  // vm/methodtable.h:2853-2862
     link.U16(argCount);

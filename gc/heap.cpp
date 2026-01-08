@@ -49,10 +49,10 @@ bool Heap::Initialize(size_t reserveBytes, MethodTable* freeObjectMT)
     s_committed = s_base;
     s_next = FirstObject();
 
-    // Real tables covering the whole reservation. JIT write barriers skip them (see below), but
-    // bulk reference copies into the heap always write them (vm/gchelpers.inl). Pages that are
-    // never written are never backed by memory. The runtime indexes them with addr >> shift, so
-    // the pointers passed to it are biased.
+    // Nothing here reads the card tables, and JIT write barriers skip them (see below), but bulk
+    // reference copies always write to them (vm/gchelpers.inl), so they have to exist and cover the
+    // whole reservation. They only cost memory where they are written. The runtime indexes them
+    // with addr >> shift, so the pointers it gets are biased.
     size_t cardBytes = reserveBytes >> CardByteShift;
     size_t bundleBytes = AlignUpTo(reserveBytes, (size_t)1 << BundleByteShift) >> BundleByteShift;
     uint8_t* cards = Reserve(cardBytes, PROT_READ | PROT_WRITE);
@@ -65,26 +65,24 @@ bool Heap::Initialize(size_t reserveBytes, MethodTable* freeObjectMT)
     if (s_startBits == nullptr || s_markBits == nullptr)
         return false;
 
-    WriteBarrierParameters args = {};  // gcinterface.h:59-116
+    WriteBarrierParameters args = {};
     args.operation = WriteBarrierOp::Initialize;
     args.is_runtime_suspended = true;
     args.requires_upper_bounds_check = false;
     args.card_table = (uint32_t*)((uintptr_t)cards - ((uintptr_t)s_base >> CardByteShift));
     args.card_bundle_table = (uint32_t*)((uintptr_t)bundles - ((uintptr_t)s_base >> BundleByteShift));
-    // True bounds, because the arm64 checked barrier drops its release ordering for
+    // These have to be the real bounds: the arm64 checked barrier drops its release ordering for
     // destinations it thinks are outside the heap.
     args.lowest_address = s_base;
     args.highest_address = s_end;
-    // Nothing is ephemeral: every reference compares below ephemeral_low, so JIT barriers
-    // return before touching cards. Frozen objects may live above the heap, hence the maximum
-    // address rather than s_end.
+    // Every reference compares below ephemeral_low, so JIT barriers return before touching cards.
+    // s_end would not be high enough, because frozen objects may live above the heap.
     args.ephemeral_low = (uint8_t*)~(uintptr_t)0;
     args.ephemeral_high = (uint8_t*)~(uintptr_t)0;
     g_ee->StompWriteBarrier(&args);
     return true;
 }
 
-// Returns zeroed space for an object range of the given size, or null when out of memory.
 uint8_t* Heap::BumpGlobal(size_t size)
 {
     uint8_t* result = nullptr;
@@ -177,7 +175,6 @@ uint8_t* Heap::TakeFree(size_t minimum, size_t maximum, size_t* taken)
     return result;
 }
 
-// A hole for exactly one object, zeroed.
 uint8_t* Heap::TakeHole(size_t size)
 {
     size_t taken;
@@ -215,8 +212,9 @@ Object* Heap::Alloc(gc_alloc_context* ctx, size_t size, uint32_t flags)
         return single(p != nullptr ? p : BumpGlobal(size));
     }
 
-    // Refill the context from a big hole, else place this object in a small one, else refill from
-    // fresh memory, else (the heap is nearly full) squeeze in just this object.
+    // In order of preference: refill the context from a big hole, put just this object in a small
+    // hole, refill the context from fresh memory, or, when the heap is nearly full, squeeze in just
+    // this object at the end.
     size_t chunkSize = ChunkSize;
     uint8_t* chunk = nullptr;
     size_t wanted = size + min_obj_size > MinHoleForContext ? size + min_obj_size : MinHoleForContext;
@@ -273,18 +271,18 @@ uint8_t* Heap::FindObject(const void* p)
         candidates = s_startBits[--word];
     }
     uint8_t* obj = s_base + (((word << 6) + (63 - (size_t)__builtin_clzll(candidates))) << 3);
-    return (const uint8_t*)p < obj + ObjectSize(obj) ? obj : nullptr;  // else p is in free space
+    return (const uint8_t*)p < obj + ObjectSize(obj) ? obj : nullptr;
 }
 
 void Heap::Erase(uint8_t* obj)
 {
     static const bool poison = getenv("MANUALGC_POISON") != nullptr;
     size_t size = ObjectSize(obj);
-    if (poison)  // makes use after free show up; allocation zeroes the memory again
+    if (poison)  // so that use after free shows up; the allocator zeroes the memory again
         memset(obj, 0xDD, size - sizeof(ObjHeader));
     s_startBits[BitIndex(obj) >> 6] &= ~(1ull << (BitIndex(obj) & 63));
     s_markBits[BitIndex(obj) >> 6] &= ~(1ull << (BitIndex(obj) & 63));
-    NextFree(obj) = nullptr;  // clears the header
+    NextFree(obj) = nullptr;
     while (size > MaxFreeObject)
     {
         MakeFreeObject(obj, MaxFreeObject);

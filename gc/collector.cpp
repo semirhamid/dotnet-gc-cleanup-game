@@ -2,6 +2,7 @@
 #include "handles.h"
 #include "heap.h"
 #include "link.h"
+#include "protocol.h"
 #include "typeinfo.h"
 
 #include <pthread.h>
@@ -14,13 +15,15 @@ namespace
     constexpr int MaxGeneration = 2;
 
     pthread_mutex_t s_collectLock = PTHREAD_MUTEX_INITIALIZER;
-    bool s_marking;  // start and mark bits are valid
+    bool s_marking;
     unsigned s_collections;
 
-    // Set once hardcore mode has freed something alive. References to nothing are then expected.
+    // Set once hardcore mode has freed something alive. From then on, dangling references are
+    // expected and must not be treated as corruption.
     bool s_heapIsDamaged;
 
-    // Hardcore mode is for the person running the app to allow, not for whoever is on the socket.
+    // Read from the environment so that only whoever started the app can allow it. Anybody can
+    // connect to the socket.
     bool HardcoreAllowed()
     {
         static const bool allowed = [] {
@@ -30,8 +33,8 @@ namespace
         return allowed;
     }
 
-    // Objects marked but not yet scanned. Explicit, so deep object graphs cannot overflow the
-    // thread's stack.
+    // Objects marked but not yet scanned. Recursing instead would overflow the thread's stack on a
+    // long linked list.
     struct MarkStack
     {
         uint8_t** items;
@@ -54,8 +57,7 @@ namespace
 
     void Mark(Object* obj, const char* source)
     {
-        // Null, frozen objects, and pointers to things that are not in this heap. Frozen objects
-        // hold no references into it.
+        // Skips null, and frozen objects, which live elsewhere and hold no references into this heap.
         if (!Heap::Contains(obj))
             return;
         if (!Heap::IsObjectStart(obj))
@@ -68,10 +70,9 @@ namespace
             s_markStack.Push((uint8_t*)obj);
     }
 
-    // Roots found by the current collection, kept for the snapshot.
     enum RootKind : uint8_t
     {
-        StackRoot = 0,  // stacks and thread statics; the EE reports both the same way
+        StackRoot = 0,
         HandleRoot = 1,
         PinnedRoot = 2,
         RefCountedRoot = 3,
@@ -102,7 +103,7 @@ namespace
     RootList s_roots;
     RootKind s_rootKind;
     bool s_recordRoots;
-    bool s_outOfMemory;  // why the current collection was started
+    bool s_outOfMemory;
 
     void Drain()
     {
@@ -116,7 +117,6 @@ namespace
         }
     }
 
-    // promote_func (gcinterface.h:25).
     void Promote(Object** slot, ScanContext*, uint32_t flags)
     {
         Object* obj = *slot;
@@ -151,7 +151,7 @@ namespace
                 if (!Collector::IsPromoted(slot->object) && g_ee->RefCountedHandleCallbacks(slot->object))
                     Promote(&slot->object, sc, 0);
                 break;
-            default:  // weak kinds do not keep anything alive; dependent handles come later
+            default:
                 break;
             }
         });
@@ -179,7 +179,7 @@ namespace
 
     ScanContext MakeScanContext()
     {
-        ScanContext sc;  // gcinterface.h:1121
+        ScanContext sc;
         sc.promotion = true;
         sc.thread_number = 0;
         sc.thread_count = 1;
@@ -200,9 +200,10 @@ namespace
             __atomic_store_n(slot, (Object*)nullptr, __ATOMIC_RELEASE);
     }
 
-    // Cuts every path by which the app could still get at a dead object. After this a dead object
-    // stays dead, so references between dead objects may dangle without harm. The order is the
-    // stock GC's; its finalization step, between short and long weak handles, does not exist here.
+    // Cuts every way the app still has of reaching a dead object. Once this has run, nothing can
+    // bring a dead object back, so it does not matter if dead objects point at erased ones.
+    // The stock GC handles short and long weak handles separately because finalization happens in
+    // between. There is no finalization here, so one pass does both.
     void SeverDead(ScanContext& sc)
     {
         Handles::ForEach([](HandleSlot* slot, uint32_t type) {
@@ -238,7 +239,6 @@ namespace
         size_t bytes;
     };
 
-    // Live and dead totals by MethodTable, for MANUALGC_LOG=2.
     struct TypeTally
     {
         MethodTable* mt;
@@ -284,20 +284,21 @@ namespace
                 live.bytes + dead.bytes + free.bytes, Heap::UsedBytes());
     }
 
+    constexpr size_t EntriesPerMessage = 4096;
+
     ViewerLink s_link;
     TypeDescriber s_types;
 
-    // Writes Reference messages of bounded size.
     struct ReferenceWriter
     {
         size_t inMessage = 0;
 
         void Add(uint8_t* from, uint8_t* to)
         {
-            if (inMessage == 4096)
+            if (inMessage == EntriesPerMessage)
                 Finish();
             if (inMessage++ == 0)
-                s_link.Begin(7);
+                s_link.Begin(Protocol::References);
             s_link.U64((uint64_t)from);
             s_link.U64((uint64_t)to);
         }
@@ -310,7 +311,6 @@ namespace
         }
     };
 
-    // Every edge that marking follows, and the roots it started from.
     void SendGraph()
     {
         ReferenceWriter writer;
@@ -342,8 +342,8 @@ namespace
 
         for (size_t i = 0; i < s_roots.count;)
         {
-            s_link.Begin(8);
-            for (size_t end = min(i + 4096, s_roots.count); i < end; i++)
+            s_link.Begin(Protocol::Roots);
+            for (size_t end = min(i + EntriesPerMessage, s_roots.count); i < end; i++)
             {
                 s_link.U64((uint64_t)s_roots.items[i].obj);
                 s_link.U8(s_roots.items[i].kind);
@@ -355,34 +355,35 @@ namespace
     void SendSnapshot()
     {
         s_types.Reset();
-        s_link.Begin(1);
-        s_link.U32(3);
+        s_link.Begin(Protocol::Hello);
+        s_link.U32(Protocol::Version);
         s_link.U32((uint32_t)getpid());
         s_link.U32(s_collections);
         s_link.U64((uint64_t)Heap::FirstObject());
         s_link.U64((uint64_t)Heap::FirstObject() + Heap::UsedBytes());
-        s_link.U8((uint8_t)((HardcoreAllowed() ? 1 : 0) | (s_outOfMemory ? 2 : 0)));
+        s_link.U8((uint8_t)((HardcoreAllowed() ? Protocol::HardcoreAllowed : 0) | (s_outOfMemory ? Protocol::OutOfMemory : 0)));
         s_link.End();
 
-        // Types are sent before the objects that use them, so each batch needs two passes.
+        // The viewer must know a type before it sees an object of it, so each batch is gone
+        // through twice: once for the types, once for the objects.
         struct Item
         {
             uint8_t* obj;
             size_t size;
             bool isFree;
         };
-        static Item batch[4096];
+        static Item batch[EntriesPerMessage];
         size_t count = 0;
         uint64_t total = 0;
         auto sendBatch = [&] {
             for (size_t i = 0; i < count; i++)
                 if (!batch[i].isFree)
                     s_types.Send(s_link, MethodTableOf(batch[i].obj));
-            s_link.Begin(4);
+            s_link.Begin(Protocol::Objects);
             for (size_t i = 0; i < count; i++)
             {
                 const Item& item = batch[i];
-                uint64_t flags = item.isFree ? 2 : Heap::IsMarked(item.obj) ? 1 : 0;
+                uint64_t flags = item.isFree ? Protocol::FreeSpace : Heap::IsMarked(item.obj) ? Protocol::Live : 0;
                 s_link.U64((uint64_t)item.obj);
                 s_link.U64(item.size | flags);
                 s_link.U64(item.isFree ? 0 : (uint64_t)MethodTableOf(item.obj));
@@ -393,13 +394,13 @@ namespace
         };
         Heap::Walk([&](uint8_t* obj, size_t size, bool isFree) {
             batch[count++] = {obj, size, isFree};
-            if (count == sizeof(batch) / sizeof(batch[0]))
+            if (count == EntriesPerMessage)
                 sendBatch();
         });
         if (count > 0)
             sendBatch();
         SendGraph();
-        s_link.Begin(5);
+        s_link.Begin(Protocol::SnapshotEnd);
         s_link.U64(total);
         s_link.End();
         s_link.Flush();
@@ -412,7 +413,7 @@ namespace
         size_t count;
         size_t bytes;
         size_t refused;
-        size_t destroyed;  // alive, hardcore mode
+        size_t destroyed;
     } s_erased;
 
     enum EraseStatus : uint8_t
@@ -446,7 +447,6 @@ namespace
         return Freed;
     }
 
-    // Serves the player until they are done or the viewer goes away.
     void Play()
     {
         s_erased = {};
@@ -454,23 +454,23 @@ namespace
         size_t size;
         while (uint8_t type = s_link.Receive(&payload, &size))
         {
-            if (type == 65)
+            if (type == Protocol::Done)
                 return;
             uint8_t flags = 0;
             uint32_t count = 0;
             constexpr size_t header = sizeof(flags) + sizeof(count);
-            if (type == 64 && size >= header)
+            if (type == Protocol::Erase && size >= header)
             {
                 flags = payload[0];
                 memcpy(&count, payload + sizeof(flags), sizeof(count));
             }
-            if (type != 64 || size != header + count * sizeof(uint64_t))
+            if (type != Protocol::Erase || size != header + count * sizeof(uint64_t))
             {
                 LogLine("bad message %u from the viewer; resuming the app", type);
                 return;
             }
-            bool force = (flags & 1) != 0 && HardcoreAllowed();
-            s_link.Begin(6);
+            bool force = (flags & Protocol::EraseLiveToo) != 0 && HardcoreAllowed();
+            s_link.Begin(Protocol::EraseResults);
             for (uint32_t i = 0; i < count; i++)
             {
                 uint64_t address;
@@ -507,7 +507,7 @@ namespace
             LogCensus();
             LogLine("gc %u marked in %.1f ms", s_collections, (double)(marked - start) / 1e6);
         }
-        // Without a player this was only a census, and the app must not notice it.
+        // With nobody playing, this was only a census for the log. Change nothing.
         if (playing)
         {
             g_ee->AfterGcScanRoots(MaxGeneration, MaxGeneration, &sc);
@@ -518,7 +518,7 @@ namespace
                 LogLine("gc %u resuming the app without a Done", s_collections);
             if (s_erased.destroyed > 0)
             {
-                SeverDead(sc);  // weak references to what was destroyed
+                SeverDead(sc);  // what was destroyed may still have weak references to it
                 LogLine("gc %u destroyed %zu live objects; expect the app to crash", s_collections, s_erased.destroyed);
             }
             Heap::Sweep();
@@ -549,12 +549,11 @@ Object* Collector::FindObject(void* p)
 
 void Collector::Collect(bool outOfMemory)
 {
-    // The order the stock workstation GC uses. GC.Collect arrives in cooperative mode
-    // (vm/comutilnative.cpp:849); waiting for another collection in that mode would deadlock,
-    // because that collection could never suspend this thread.
+    // Same order as the stock workstation GC. GC.Collect arrives in cooperative mode
+    // (vm/comutilnative.cpp:849). Waiting for the lock in that mode would deadlock, because the
+    // collection that holds it could never suspend this thread.
     bool wasCooperative = g_ee->EnablePreemptiveGC();
     pthread_mutex_lock(&s_collectLock);
-    // Without a viewer there is nobody to collect, unless the log wants the census.
     if (!s_link.Connect() && LogLevel() == 0)
     {
         pthread_mutex_unlock(&s_collectLock);
@@ -576,12 +575,15 @@ void Collector::Collect(bool outOfMemory)
 
 bool Collector::CollectForAllocation()
 {
-    // Several threads usually run out together. The first one's collection is enough for all.
+    // Threads tend to run out of memory together, and one collection is enough for all of them.
     static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
-    static uint64_t s_uselessUntil;  // after a round that made no room, let the app see the failure
+    // After a round that made hardly any room, allocations fail until this time, so that the app
+    // gets to see the OutOfMemoryException instead of freezing again at once.
+    static uint64_t s_uselessUntil;
+    constexpr uint64_t UselessNanoseconds = 5000000000;
     unsigned before = s_totals.collections;
 
-    bool wasCooperative = g_ee->EnablePreemptiveGC();  // others may wait here for a long time
+    bool wasCooperative = g_ee->EnablePreemptiveGC();
     pthread_mutex_lock(&s_lock);
     bool retry = s_totals.collections != before;
     if (!retry && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= s_uselessUntil)
@@ -593,7 +595,7 @@ bool Collector::CollectForAllocation()
             g_ee->EnablePreemptiveGC();
         retry = s_totals.collections != before;
         if (!retry || s_erased.bytes < Heap::ReservedBytes() / 64)
-            s_uselessUntil = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 5000000000ull;
+            s_uselessUntil = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + UselessNanoseconds;
     }
     pthread_mutex_unlock(&s_lock);
     if (wasCooperative)
