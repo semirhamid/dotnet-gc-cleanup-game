@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage 3 "done when": GC.Collect() in a sample shows the heap in the viewer.
+# The viewer: when a sample calls GC.Collect(), its heap must show up there, complete and named.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/stage3
@@ -34,7 +34,7 @@ check "a page from another site cannot connect" 0 0 $OUT/origin.log 403
 curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://127.0.0.1:$WEB_PORT/" > $OUT/host.log
 check "another host name is rejected" 0 0 $OUT/host.log 400
 
-if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then
+if can_drive_chrome; then
     limit 60 node tests/page3.mjs http://localhost:$WEB_PORT/ $OUT/page.png > $OUT/page.log 2>&1; rc=$?
     check "page draws the heap without script errors ($OUT/page.png)" 0 $rc $OUT/page.log "ok"
 else

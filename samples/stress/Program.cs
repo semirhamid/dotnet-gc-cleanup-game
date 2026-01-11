@@ -30,7 +30,6 @@ var workers = Enumerable.Range(0, 6).Select(t => new Thread(() =>
                 roots[i] = Node.Tree(random, random.Next(1, 6));
                 break;
             case 3:
-                // Move a subtree, so it is reachable only through a new path.
                 if (roots[i]?.Left is { } left) { roots[i]!.Left = null; roots[random.Next(roots.Length)] = left; }
                 break;
             case 4:

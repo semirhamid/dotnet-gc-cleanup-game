@@ -1,10 +1,11 @@
-# Shared by the stage scripts. Source it from the repository root.
+# Shared by the test scripts. Source it from the repository root, with OUT set.
 DOTNET=${DOTNET:-/opt/homebrew/bin/dotnet}
 VERSION=10.0.14
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 unset DOTNET_GCName DOTNET_GCPath DOTNET_GCHeapHardLimit DOTNET_gcServer MANUALGC_LOG
 failures=0
 
+# macOS has no timeout(1).
 limit() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; } # seconds, command
 
 check() { # name, expected exit code, actual exit code, output file, [text that must appear]
@@ -34,7 +35,7 @@ finish() {
     exit $((failures > 0))
 }
 
-# Ports used by tests, so a viewer you have open is left alone.
+# Not the default ports, so that tests do not disturb a viewer you have open.
 WEB_PORT=5721
 export MANUALGC_PORT=5720
 
@@ -53,6 +54,24 @@ build_project() { # path, log name
 }
 
 player() { limit 100 "$DOTNET" tests/player/bin/Release/net10.0/player.dll $WEB_PORT "$@"; }
+
+# Runs a command with a viewer and a scripted player, and leaves its exit code in rc.
+# VIEWER_ARGS are passed to the viewer.
+VIEWER_ARGS=
+with_player() { # mode, log name, command...
+    local mode=$1 log=$2; shift 2
+    start_viewer $VIEWER_ARGS
+    player $mode > $OUT/$log.player.log 2>&1 & local playing=$!
+    await connected $OUT/$log.player.log
+    "$@" > $OUT/$log.log 2>&1; rc=$?
+    sleep 0.3  # lets the player see the end of the last round
+    stop_viewer
+    wait $playing 2> /dev/null
+}
+
+can_drive_chrome() {
+    command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]
+}
 
 await() { # text, file
     for _ in $(seq 200); do grep -qF -- "$1" "$2" 2> /dev/null && return; sleep 0.05; done

@@ -15,4 +15,6 @@ try {
   console.log(title, `${colours} colours, ${rows} types`, page.errors);
   if (colours < 8 || rows < 20 || page.errors.length || !title.includes('collection 1')) process.exitCode = 1;
   else console.log('ok');
-} finally { await page.close(); }
+} finally {
+  await page.close();
+}

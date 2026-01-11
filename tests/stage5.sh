@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stage 5: score by bytes freed, lives, a timer, and a hardcore mode that is off by default, needs
-# the app's permission, and is labelled as crashing the app.
+# The game: scoring, lives, the timer, and hardcore mode, which must be off by default, need the app's
+# permission and say that it crashes the app. Also what a hostile viewer can do (nothing).
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/stage5
@@ -11,17 +11,6 @@ build_project viewer/viewer.csproj viewer
 build_project tests/player/player.csproj player
 
 app() { env DOTNET_GCName=libmanualgc.dylib MANUALGC_LOG=1 perl -e 'alarm 60; exec @ARGV' "$DOTNET" "$@"; }
-with_player() { # mode, log name, command...
-    local mode=$1 log=$2; shift 2
-    start_viewer $VIEWER_ARGS
-    player $mode > $OUT/$log.player.log 2>&1 & local playing=$!
-    await connected $OUT/$log.player.log
-    "$@" > $OUT/$log.log 2>&1; rc=$?
-    sleep 0.3
-    stop_viewer
-    wait $playing 2> /dev/null
-}
-VIEWER_ARGS=
 
 # 200 arrays of 500 to 699 bytes: each takes 24 + length rounded up to 8.
 want=$(python3 -c 'print(sum((24 + n + 7) // 8 * 8 for n in range(500, 700)))')
@@ -62,7 +51,7 @@ for attack in force bogus garbled huge silent; do
     wait $ROGUE; check "    GC refused" 0 $? $OUT/rogue.$attack.log ok
 done
 
-if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then
+if can_drive_chrome; then
     for mode in safe hardcore; do
         [ $mode = hardcore ] && export MANUALGC_HARDCORE=1
         start_viewer

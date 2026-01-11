@@ -1,6 +1,6 @@
 #!/bin/bash
-# The flight game: the graph sent to the page must lead a player who reads the ropes correctly to all
-# of the garbage and to nothing alive, and the page must play.
+# The flight game. A player who follows the ropes correctly must find all of the garbage and hit nothing
+# alive, and the page itself must be playable.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/flight
@@ -11,16 +11,6 @@ build_project tests/player/player.csproj player
 
 app() { env DOTNET_GCName=libmanualgc.dylib MANUALGC_LOG=1 perl -e 'alarm 120; exec @ARGV' "$DOTNET" "$@"; }
 limited() { env DOTNET_GCHeapHardLimit=0x2000000 DOTNET_GCName=libmanualgc.dylib perl -e 'alarm 100; exec @ARGV' "$DOTNET" "$@"; }
-with_player() { # mode, log name, command...
-    local mode=$1 log=$2; shift 2
-    start_viewer
-    player $mode > $OUT/$log.player.log 2>&1 & local playing=$!
-    await connected $OUT/$log.player.log
-    "$@" > $OUT/$log.log 2>&1; rc=$?
-    sleep 0.3
-    stop_viewer
-    wait $playing 2> /dev/null
-}
 graphs() { # log: every graph agreed with the GC, every round found all garbage, nothing was refused
     local log=$OUT/$1.player.log
     local all=$(grep -c '^graph ' $log) agreed=$(grep -c ' 0 disagreements' $log) clean=$(grep -c '^resumed: done, missed 0,' $log)
@@ -47,7 +37,7 @@ with_player strafe strafe app $(sample airfield) 1
 check "a live balloon of many objects costs one life" 0 $rc $OUT/strafe.player.log '"live":true,"count":0,"bytes":0}] {"lives":2'
 check "a wreck costs one life" 0 $rc $OUT/strafe.player.log 'after crash: {"lives":1'
 
-if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then
+if can_drive_chrome; then
     start_viewer
     app $(sample airfield) 1 > $OUT/page.app.log 2>&1 & APP=$!
     await "Collection 1" $OUT/viewer.log

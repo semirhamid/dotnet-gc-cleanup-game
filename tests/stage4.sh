@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stage 4 "done when": memory is reused after erasing, verified by a sample that would otherwise
-# run out of a small fixed heap limit.
+# Erasing: memory must be reused, shown by a sample that otherwise runs out of a small heap. Nothing
+# alive may be freed.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/stage4
@@ -10,21 +10,12 @@ build ration stress orchard garbage
 build_project viewer/viewer.csproj viewer
 build_project tests/player/player.csproj player
 
-with_player() { # mode, log name, command...
-    local mode=$1 log=$2; shift 2
-    start_viewer
-    player $mode > $OUT/$log.player.log 2>&1 & local playing=$!
-    await connected $OUT/$log.player.log
-    "$@" > $OUT/$log.log 2>&1; rc=$?
-    stop_viewer
-    wait $playing 2> /dev/null
-}
 gc() { env DOTNET_GCName=libmanualgc.dylib MANUALGC_LOG=1 "$@"; }
 app() { gc perl -e 'alarm 100; exec @ARGV' "$DOTNET" "$@"; }
 limited() { gc perl -e 'alarm 100; exec @ARGV' env DOTNET_GCHeapHardLimit=0x2000000 "$DOTNET" "$@"; }
 
 limited $(sample ration) > $OUT/noviewer.log 2>&1; rc=$?
-# With no room left the sample may not even be able to report it, so it can also die here.
+# With no room left the sample may die before it can report anything, so any failure will do.
 [ $rc != 0 ] && rc=failed
 check "32 MB limit, no viewer: runs out of memory" failed $rc $OUT/noviewer.log "ut of memory"
 with_player idle idle limited $(sample ration)
@@ -63,7 +54,7 @@ wait $APP; rc=$?
 check "killing the viewer mid-collection resumes the app" 0 $rc $OUT/killed.log "resuming the app without a Done"
 ! grep -q "did not wait" $OUT/killed.log; check "    and it was waiting until then" 0 $? $OUT/killed.log
 
-if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then
+if can_drive_chrome; then
     start_viewer
     app $(sample orchard) > $OUT/page.app.log 2>&1 & APP=$!
     await "Collection 1" $OUT/viewer.log

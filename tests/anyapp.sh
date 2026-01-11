@@ -1,6 +1,6 @@
 #!/bin/bash
-# Any .NET web app: untouched template apps, apps built for older .NET, and one with a hard memory
-# limit, all started with ./play, frozen from the viewer, and played while serving requests.
+# ./play with web apps that know nothing about this GC: template apps, apps built for older .NET, and
+# one with a memory limit. They are frozen from the viewer and played while they serve requests.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/anyapp
@@ -42,7 +42,6 @@ played() { # log: rounds were played, agreed with the GC, refused nothing, freed
     check "    $rounds rounds, $agreed agree with the GC, $erased objects freed, $refused refused" 0 $? $OUT/$1.log
 }
 
-# Templates, as Microsoft ships them.
 for kind in webapp mvc; do
     (cd $OUT && "$DOTNET" new $kind -o $kind --no-https) > $OUT/$kind.new.log 2>&1
     start_app $kind $OUT/$kind
@@ -55,11 +54,17 @@ done
 
 # Built with an older SDK for an older .NET, run from the dll.
 OLD=/usr/local/share/dotnet/dotnet
+build_old_app() ( # .NET version, SDK version
+    pin="{\"sdk\":{\"version\":\"$2\"}}"
+    mkdir -p $OUT/net$1 && cd $OUT/net$1 && echo "$pin" > global.json &&
+        $OLD new webapp -n App -o . --no-https --force &&
+        echo "$pin" > global.json &&  # the template may have replaced it
+        $OLD build -c Release
+)
 for v in 8 9; do
     sdk=$($OLD --list-sdks 2> /dev/null | grep "^$v\." | tail -1 | cut -d' ' -f1)
     if [ -z "$sdk" ]; then echo "SKIP  .NET $v app (no SDK)"; continue; fi
-    mkdir -p $OUT/net$v && echo "{\"sdk\":{\"version\":\"$sdk\"}}" > $OUT/net$v/global.json
-    if (cd $OUT/net$v && $OLD new webapp -n App -o . --no-https --force && echo "{\"sdk\":{\"version\":\"$sdk\"}}" > global.json && $OLD build -c Release) > $OUT/net$v.new.log 2>&1; then
+    if build_old_app $v "$sdk" > $OUT/net$v.new.log 2>&1; then
         cp -R $OUT/net$v/wwwroot $OUT/net$v/bin/Release/net$v.0/
         start_app net$v $OUT/net$v/bin/Release/net$v.0/App.dll
         start_player net$v 300
@@ -83,7 +88,7 @@ stop_app
 played limit
 grep "] exit" $OUT/limit.log | sed 's/^/        /'
 
-if command -v node > /dev/null && [ -x "${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}" ]; then
+if can_drive_chrome; then
     start_app button $OUT/webapp
     limit 60 node tests/page7.mjs http://localhost:$WEB_PORT/flight.html $OUT/ > $OUT/page.log 2>&1; rc=$?
     check "the page freezes an app that never collects" 0 $rc $OUT/page.log "ok"
@@ -93,15 +98,16 @@ else
     echo "SKIP  page check (needs node and Chrome)"
 fi
 
-# The memory limit without a player: the app must fail the way .NET apps do, not hang or corrupt.
+# The same limit with no viewer to play in. Requests must fail as they do in any .NET app that runs out
+# of memory, without hanging.
 start_app noplayer --limit 64 samples/webapp
 kill $(pgrep -f "viewer.dll --WebPort $WEB_PORT") 2> /dev/null; sleep 0.5
 PLAYER=
 got=$(load 400 /work/{}); echo "$got" > $OUT/noplayer.served.log
-case "$got" in "400 200") false;; *) true;; esac; check "64 MB limit, no viewer: requests fail once it is full ($got)" 0 $? $OUT/noplayer.served.log
+[ "$got" != "400 200" ]; check "64 MB limit, no viewer: requests fail once it is full ($got)" 0 $? $OUT/noplayer.served.log
 stop_app
 
-# Things that cannot work say so.
+# What cannot work must say why.
 mkdir -p $OUT/empty
 refuse() { ./play "${@:3}" > $OUT/refuse.log 2>&1; rc=$?; [ $rc != 0 ] && rc=refused; check "$1" refused $rc $OUT/refuse.log "$2"; }
 refuse "a folder without a project is refused" "has 0 project files" $OUT/empty

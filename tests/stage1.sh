@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stage 1 "done when": hello and a sample allocating a few hundred MB run to completion on the
-# stock runtime with DOTNET_GCName pointing at the library.
+# Allocation: hello and a sample that allocates a few hundred MB must run to completion on the stock
+# runtime with this GC.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/stage1
@@ -10,7 +10,7 @@ build hello churn
 HELLO=$(sample hello)
 CHURN=$(sample churn)
 
-# Without the log line the other checks could pass on the stock GC.
+# The log line is how we know that it was not the stock GC that ran.
 export MANUALGC_LOG=1 DOTNET_GCName=libmanualgc.dylib
 limit 120 "$DOTNET" $HELLO > $OUT/hello.log 2>&1; rc=$?
 check "hello loads our GC" 0 $rc $OUT/hello.log "[manualgc"

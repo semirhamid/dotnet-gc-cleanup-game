@@ -7,14 +7,16 @@
 //   bytes   in every collection, erase every byte[] without peeking, and print the score
 //   wait    do nothing and let the time run out
 //   hardcore  in one collection, turn hardcore on and erase every live Kept object
-//   flight  in every collection, get the object graph, work out from its arrows what no root reaches,
-//           and shoot all of that; prints a line if the graph would have misled a player
+//   flight  in every collection, get the object graph, work out from its edges what no root reaches,
+//           and shoot all of that; prints how many objects the graph and the GC disagree about
 //   strafe  in one collection, shoot one live node that stands for several objects, then crash once
 // A third argument of N asks the first attached app to collect every N milliseconds.
 // Modes that play every collection stop when the viewer goes away.
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+
+const uint SnapshotTag = 1, LivenessTag = 2;
 
 string mode = args[1];
 using var socket = new ClientWebSocket();
@@ -63,7 +65,8 @@ try
                 case "erased" when mode is "flight" or "strafe":
                     freed += message.GetProperty("freed").GetArrayLength();
                     refused += message.GetProperty("live").GetArrayLength();
-                    foreach (JsonElement hit in message.GetProperty("hits").EnumerateArray()) waiting -= hit.GetProperty("count").GetInt32();
+                    foreach (JsonElement hit in message.GetProperty("hits").EnumerateArray())
+                        waiting -= hit.GetProperty("count").GetInt32();
                     if (mode == "strafe")
                     {
                         Console.WriteLine($"shot: {message.GetProperty("hits")} {message.GetProperty("state")}");
@@ -74,7 +77,7 @@ try
                 case "erased":
                     freed += message.GetProperty("freed").GetArrayLength();
                     refused += message.GetProperty("live").GetArrayLength();
-                    if (await OnErased(message)) return 0;
+                    await OnErased(message);
                     break;
                 case "resumed":
                     Console.WriteLine($"resumed: {message.GetProperty("reason").GetString()}, missed {message.GetProperty("missedBytes")}, {message.GetProperty("state")}");
@@ -84,11 +87,11 @@ try
             continue;
         }
         uint tag = BitConverter.ToUInt32(data);
-        if (tag == 1)
+        if (tag == SnapshotTag)
         {
             words = MemoryMarshal.Cast<byte, uint>(data.AsSpan()).ToArray();
             rounds++;
-            // A finished collection is sent to new pages too; there is nothing to play in it.
+            // New pages are also sent a collection that is already over. There is nothing to play in it.
             if (!info.GetProperty("frozen").GetBoolean()) continue;
             if (mode is "flight" or "strafe")
             {
@@ -105,7 +108,7 @@ try
                 await Send(new { type = "reveal" });
             }
         }
-        else if (tag == 2)
+        else if (tag == LivenessTag)
         {
             live = data[8..];
             await Play();
@@ -181,7 +184,7 @@ async Task Erase(int[] targets)
     foreach (int[] chunk in targets.Chunk(10_000)) await Send(new { type = "erase", blocks = chunk });
 }
 
-async Task<bool> OnErased(JsonElement message)
+async Task OnErased(JsonElement message)
 {
     int lives = message.GetProperty("state").GetProperty("lives").GetInt32();
     if (mode == "bytes")
@@ -210,7 +213,6 @@ async Task<bool> OnErased(JsonElement message)
     {
         await Send(new { type = "done" });
     }
-    return false;
 }
 
 void Look()

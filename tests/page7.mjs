@@ -11,7 +11,11 @@ try {
   await sleep(800);
   await page.screenshot(process.argv[3] + 'round.png');
   await page.eval('document.getElementById("land").click()');
-  await page.until('game.mode === "over" && document.querySelectorAll("#apps button").length === 1 && !document.querySelector("#apps button").disabled');
+  await page.until(
+    'game.mode === "over" && document.querySelectorAll("#apps button").length === 1 && !document.querySelector("#apps button").disabled',
+  );
   if (page.errors.length) throw new Error(page.errors.join());
   console.log('ok');
-} finally { await page.close(); }
+} finally {
+  await page.close();
+}

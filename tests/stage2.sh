@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stage 2 "done when": the log of live and dead counts and bytes matches expectations on a
-# sample with known garbage.
+# Marking: on a sample whose garbage is known, the live and dead counts and bytes in the log must be
+# exactly as expected.
 set -u
 cd "$(dirname "$0")/.."
 OUT=artifacts/stage2
@@ -17,7 +17,7 @@ for i in $(seq "$RUNS"); do
 done
 grep " live .* walked " $OUT/garbage.1.err | sed 's/^/        /'
 
-# Marks under load: any reference to something that is not an object ends the process.
+# Marking under load. A reference to something that is not an object would end the process.
 for i in $(seq "$RUNS"); do
     MANUALGC_LOG=1 limit 120 "$DOTNET" $(sample churn) collect > $OUT/churn.$i.log 2>&1; rc=$?
     check "churn run $i with two threads collecting: $(grep -c ' walked ' $OUT/churn.$i.log) collections" 0 $rc $OUT/churn.$i.log "collections requested: $(grep -c ' walked ' $OUT/churn.$i.log)"

@@ -21,8 +21,6 @@ static class Program
     [MethodImpl(MethodImplOptions.NoInlining)]
     static void Escape(object _) { }
 
-    // ---- Objects reached through fields, statics, handles and other threads ----
-
     static LiveNode? s_list;
     [ThreadStatic] static ThreadStaticRoot? t_root;
     static GCHandle s_strong, s_pinned;
@@ -39,7 +37,6 @@ static class Program
         for (int i = 0; i < 1000; i++) Escape(new Garbage());
         for (int i = 0; i < 10; i++)
         {
-            // Cycles are still garbage.
             var a = new CycleNode();
             a.Other = new CycleNode { Other = a };
         }
@@ -84,7 +81,7 @@ static class Program
         Expect(Type.GetType("System.Reflection.LoaderAllocator", throwOnError: true)!, 1, 48, 0, 0);
     }
 
-    // ---- Interior pointers: the only reference to each object points inside it ----
+    // Interior pointers: the only reference to each object points inside it
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     static ref long LastElement() => ref (new long[1000])[999];
@@ -95,7 +92,7 @@ static class Program
     [MethodImpl(MethodImplOptions.NoInlining)]
     static ref int Field() => ref new HasField().B;
     [MethodImpl(MethodImplOptions.NoInlining)]
-    static Span<char> EmptyEnd() => new char[4].AsSpan()[4..];  // points just past the last element
+    static Span<char> EmptyEnd() => new char[4].AsSpan()[4..];
     [MethodImpl(MethodImplOptions.NoInlining)]
     static ref object Reference() => ref new HasReference { Target = new ViaInterior() }.Target;
 
@@ -120,8 +117,6 @@ static class Program
         GC.KeepAlive(reference);
         Console.WriteLine($"interior targets usable: {last + first + middle + field == 10 && reference is ViaInterior && empty.Length == 0}");
     }
-
-    // ---- Roots on other threads' stacks, one blocked and one running managed code ----
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     static void OtherThreads()

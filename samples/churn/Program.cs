@@ -1,6 +1,8 @@
-// Allocates several hundred MB in many shapes and checks the data afterwards. Exits 1 if a
-// check fails. First argument: megabytes to allocate in the main workload (default 400), or
-// "collect" for 60 MB with two threads calling GC.Collect() alongside, or "oom" to fill the heap with live arrays and catch the OutOfMemoryException.
+// Allocates several hundred MB in many shapes and checks the data afterwards. Exits 1 if a check
+// fails. The argument is one of:
+//   a number   megabytes to allocate in the main workload (default 400)
+//   collect    60 MB, with two threads calling GC.Collect() alongside
+//   oom        fill the heap with live arrays and catch the OutOfMemoryException
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -13,7 +15,6 @@ if (args is ["oom"])
     }
     catch (OutOfMemoryException)
     {
-        // One failed allocation must not poison later ones.
         var small = new byte[1000];
         Console.WriteLine($"caught OutOfMemoryException after {blocks.Count} blocks, then allocated {small.Length} bytes");
         return 0;
@@ -83,7 +84,7 @@ Check(edges.All(a => a.AsSpan().IndexOfAnyExcept((byte)a.Length) < 0), "sizes ar
 var source = Enumerable.Range(0, 100_000).Select(i => new object()).ToArray();
 var target = new object[source.Length];
 Array.Copy(source, target, source.Length);          // bulk reference copy: writes the card tables
-Array.Copy(target, 0, target, 1, target.Length - 1); // overlapping
+Array.Copy(target, 0, target, 1, target.Length - 1);
 Check(target[0] == source[0] && target[^1] == source[^2], "bulk reference copies");
 
 var dictionary = new Dictionary<string, List<int>>();
@@ -150,7 +151,7 @@ long delta = GC.GetAllocatedBytesForCurrentThread() - before;
 Check(delta == 1024 && measured.Length == 1000, $"per-thread allocation accounting (1000-byte array = {delta} bytes)");
 GC.Collect();
 GC.WaitForPendingFinalizers();
-Check(GC.CollectionCount(0) == 0 && Finalizable.Runs == 0, "GC.Collect is a no-op, finalizers do not run");
+Check(GC.CollectionCount(0) == 0 && Finalizable.Runs == 0, "GC.Collect is a no-op without a viewer, finalizers do not run");
 Check(GC.GetTotalMemory(false) > megabytes * 1024L * 1024, $"heap grew to {GC.GetTotalMemory(false) >> 20} MB");
 Volatile.Write(ref workDone, true);
 collectors.ForEach(c => c.Join());

@@ -1,5 +1,5 @@
-// A heap whose references make a good puzzle: for the flight game. Arguments: how many collections
-// to request (default 3). What is dropped looks much like what is kept; only who holds it differs.
+// A puzzle for the flight game. What is dropped looks much like what is kept, so a player has to look at
+// what holds it. Argument: how many collections to request (default 3).
 using System.Runtime.CompilerServices;
 
 int rounds = args.Length > 0 ? int.Parse(args[0]) : 3;
@@ -23,7 +23,6 @@ sealed class Airfield
     [MethodImpl(MethodImplOptions.NoInlining)]
     public void Busy(int round)
     {
-        // Kept: hangars with planes whose crews know each other.
         for (int i = 0; i < 4; i++)
         {
             var hangar = new Hangar($"hangar {round}-{i}");
@@ -40,7 +39,7 @@ sealed class Airfield
             Drop(hangar);
         }
 
-        // Dropped planes that hold on to live pilots and hangars. Holding something alive does not help.
+        // Dropped planes that refer to live pilots and hangars. That does not keep the planes alive.
         foreach (Hangar hangar in _hangars.TakeLast(4))
             Drop(new Plane(hangar, hangar.Planes[1].Pilot) { Wingman = new Plane(hangar, hangar.Planes[2].Pilot) });
 
@@ -48,11 +47,10 @@ sealed class Airfield
         Drop(Convoy(12));
         _hangars[^1].Convoy = Convoy(8);
 
-        // Held only by an event subscription, the classic leak. It is alive whether you like it or not.
+        // Held only by an event subscription, the classic leak, so it is alive.
         var forgotten = new Radar();
         Departed += forgotten.Sweep;
 
-        // Rings of dropped beacons, and loose freight of all sizes.
         for (int i = 0; i < 3; i++)
         {
             var first = new Beacon();
