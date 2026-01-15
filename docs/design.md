@@ -1,7 +1,7 @@
 # Design
 
 Pinned to Microsoft.NETCore.App 10.0.14 on osx-arm64, GC interface 5.5, EE interface 4. Line
-references are to dotnet/runtime tag v10.0.14. Current as of Stage 5.
+references are to dotnet/runtime tag v10.0.14.
 
 ## Heap layout
 
@@ -68,10 +68,12 @@ freed, so whatever it would have released leaks. That is safe, but a program tha
 ## What starts a collection
 
 - The app: `GC.Collect()` and other blocking requests.
-- The viewer: a native thread keeps a control connection open and collects when told to, so apps that
-  never ask can be played. It is created not suspendable, like the stock server GC's threads.
-- A full heap: an allocation that fails lets a person make room and tries again, a few times. If a
-  round made next to none, allocations fail with OutOfMemoryException for 5 seconds before it asks again.
+- The viewer: a native thread keeps a control connection open and collects when told to, so that apps
+  which never call `GC.Collect()` can be played too. Like the stock server GC's threads, it is not
+  suspendable.
+- A full heap: when an allocation fails, a person gets to make room and the allocation is tried again,
+  up to four times. After a round that made next to no room, allocations fail with
+  OutOfMemoryException for 5 seconds before anyone is asked again.
 
 Memory pressure requests from the VM are ignored. The app is suspended for the whole round, so its
 requests and timers wait.
@@ -93,9 +95,9 @@ On the thread that started it:
    matter that unerased dead objects may refer to erased ones: nothing ever follows them.
 7. Send the snapshot and serve Erase until Done or the connection closes. Erasing checks that the
    address is an object start and unmarked, then makes it a free object.
-8. Sweep: merge neighbouring free objects and rebuild the free lists. Resume.
+8. Sweep: merge neighbouring free objects and rebuild the free lists. Resume the app.
 
-Without a viewer, steps 6 to 8 do not happen: a census for the log changes nothing.
+Without a viewer, steps 6 to 8 are skipped. That is a census for the log, and it changes nothing.
 
 An interior pointer is resolved by searching the start bitmap downwards. Any other reference that
 is not the start of an object ends the process: it means the heap is corrupt. Frozen objects count
@@ -142,14 +144,19 @@ listens on loopback only and refuses pages from other origins and host names.
 The GC sends the references and roots it marked from. The viewer marks again from those alone and
 counts objects where it and the GC disagree; tests/flight.sh requires zero.
 
-A heap has too many objects to fly through, so the viewer shrinks the graph to at most about 150 nodes
-(ObjectGraph.cs): things held by only one other go into their holder, like objects with one holder are
-joined, the least interesting live branches fold into what holds them, and small garbage is put
-together by type. Objects that are alive and dead are never put together, and every edge marking needs
-is kept, so a node is garbage exactly when no path of edges leads to it from a root node. The page is
-not told which nodes those are. It can work that out, and does so for the flare, for explaining a
-refused shot, and for choosing where crows come from.
+A heap has too many objects to fly through, so the viewer shrinks the graph to about 150 nodes at most
+(ObjectGraph.cs):
+
+- Objects that hold nothing and have a single holder become part of it.
+- Objects of one type with the same holder are joined.
+- The least interesting live branches become part of what holds them.
+- Small garbage is put together by type.
+
+Live and dead objects are never put together, and every edge that marking needs is kept, so a node is
+garbage exactly when no path of edges leads to it from a root node. The page is not told which nodes
+those are. It can work that out, and does so for the flare, for explaining a refused shot, and for
+choosing where crows come from.
 
 Shooting a node erases everything in it, if it is dead. A live node costs one life however many objects
 it stands for, so only one of them is put to the GC. Three hits by crows also cost a life. Points are for
-fun; the score is still the bytes freed. Hardcore mode is not offered here.
+fun; the score is still the bytes freed. There is no hardcore mode here.

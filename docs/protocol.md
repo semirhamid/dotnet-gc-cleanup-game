@@ -1,5 +1,7 @@
 # GC to viewer protocol, version 3
 
+The numbers below are in `gc/protocol.h` and `viewer/Protocol.cs`. Change them together.
+
 The GC connects to `127.0.0.1:5710` (`MANUALGC_PORT`; 0 turns the viewer off) each time it
 collects, and closes the connection when the app resumes. The app stays suspended from before Hello
 until the viewer sends Done or closes the connection. If nothing is listening, the collection

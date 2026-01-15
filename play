@@ -18,7 +18,7 @@ fi
 APP=$1; shift
 [ -e "$APP" ] || fail "no such file or folder: $APP"
 
-# A project is built as usual and run from its folder, where its settings and wwwroot are.
+# Projects are built, then run from their own folder, because that is where settings and wwwroot are.
 if [ -d "$APP" ]; then
     count=$(find "$APP" -maxdepth 1 -name '*.csproj' | wc -l | tr -d ' ')
     [ "$count" = 1 ] || fail "$APP has $count project files; name the one to run"
@@ -43,8 +43,9 @@ CONFIG=${APP%.dll}.runtimeconfig.json
 [ -f "$CONFIG" ] || fail "$APP has no runtimeconfig.json next to it, so it is a library, or a .NET Framework app"
 grep -q '"includedFrameworks"' "$CONFIG" && fail "$APP is self-contained; publish it framework-dependent"
 
-# Only the .NET 10 runtime can load this GC, so older apps run on that.
-VERSION=$(grep -A1 '"Microsoft.NETCore.App"\|"Microsoft.AspNetCore.App"' "$CONFIG" | grep -o '"version": *"[0-9]*' | grep -o '[0-9]*$' | head -1)
+# This GC only works with the .NET 10 runtime, so apps built for older versions run on that too.
+VERSION=$(grep -A1 '"Microsoft.NETCore.App"\|"Microsoft.AspNetCore.App"' "$CONFIG" |
+    grep -o '"version": *"[0-9]*' | grep -o '[0-9]*$' | head -1)
 case "$VERSION" in
 10) ;;
 [1-9]) echo "play: built for .NET $VERSION, running on .NET 10 instead"; export DOTNET_ROLL_FORWARD=Major ;;
